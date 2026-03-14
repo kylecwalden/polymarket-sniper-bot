@@ -187,7 +187,7 @@ polymarket-sniper-bot/
 
 If this bot makes you money, consider tipping the developer:
 
-**Polygon/Ethereum:** `0x297593a37c7CE7368AB822e6369D90BFC01B0da8`
+**Polygon/Ethereum (ERC-20):** `0x75A895ab14E58Af90e6CD9609EaACdfB5Ef07a36`
 
 ## Helpful Links
 
