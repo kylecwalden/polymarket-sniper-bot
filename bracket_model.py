@@ -142,8 +142,28 @@ FORECAST_ERROR_STD = {
 }
 
 
-def _get_forecast_std(source: str, hours_remaining: float, unit: str) -> float:
-    """Get forecast error standard deviation based on source and timeframe."""
+def _get_forecast_std(source: str, hours_remaining: float, unit: str,
+                      override_std: float | None = None, confidence: float = 1.0) -> float:
+    """Get forecast error standard deviation based on source and timeframe.
+
+    Args:
+        source: "noaa", "open-meteo", "ensemble", "observation"
+        hours_remaining: Hours until market resolution
+        unit: "°F" or "°C"
+        override_std: If provided (from ensemble/observation), use this directly
+        confidence: Multiplier from ensemble (>1 = tighter, <1 = wider)
+    """
+    # Observation data — very tight uncertainty
+    if source == "observation" or override_std is not None:
+        if override_std is not None:
+            std = override_std
+        else:
+            std = 0.5  # °C for observations
+        # Convert if needed
+        if unit == "°F" and source in ("observation", "ensemble"):
+            std = std * 9 / 5
+        return std
+
     errors = FORECAST_ERROR_STD.get(source, FORECAST_ERROR_STD["open-meteo"])
 
     if hours_remaining < 12:
@@ -157,6 +177,12 @@ def _get_forecast_std(source: str, hours_remaining: float, unit: str) -> float:
     if source == "noaa" and unit == "°C":
         std = std * 5 / 9
 
+    # Apply confidence multiplier from ensemble
+    # confidence > 1 = models agree = tighter std
+    # confidence < 1 = models disagree = wider std
+    if confidence != 1.0 and confidence > 0:
+        std = std / confidence
+
     return std
 
 
@@ -168,6 +194,8 @@ def weather_bracket_prob(
     hours_remaining: float,
     source: str = "noaa",
     unit: str = "°F",
+    confidence: float = 1.0,
+    forecast_std_override: float | None = None,
 ) -> float:
     """Compute probability that actual high temp falls in bracket.
 
@@ -182,11 +210,14 @@ def weather_bracket_prob(
         hours_remaining: Hours until resolution
         source: "noaa" or "open-meteo"
         unit: "°F" or "°C"
+        confidence: Ensemble confidence (>1 = tighter, <1 = wider)
+        forecast_std_override: Direct std override from ensemble/observation
 
     Returns:
         Probability between 0 and 1
     """
-    std = _get_forecast_std(source, hours_remaining, unit)
+    std = _get_forecast_std(source, hours_remaining, unit,
+                            override_std=forecast_std_override, confidence=confidence)
 
     if std < 0.01:
         std = 0.01  # Prevent division by zero

@@ -1,5 +1,5 @@
 """
-Bracket Market Engine v4.2
+Bracket Market Engine v4.3
 Trades daily BTC/ETH price brackets and weather temperature brackets.
 
 v4.1 changes (limit order hybrid):
@@ -36,7 +36,7 @@ from bracket_model import (
     estimate_volatility, score_bracket, BracketScore,
     POLYMARKET_FEE,
 )
-from noaa_feed import get_forecast, CityForecast
+from noaa_feed import get_forecast, CityForecast, is_observation_complete
 from trader import init_client, PlacedOrder, save_order
 from vpn import ensure_vpn
 import telegram_alerts as tg
@@ -72,6 +72,10 @@ V4_MIN_EDGE_CRYPTO = float(os.getenv("V4_MIN_EDGE_CRYPTO", "0.10"))    # 10% for
 # Win-rate optimization — favor bets we're likely to WIN
 V4_MIN_WIN_PROB = float(os.getenv("V4_MIN_WIN_PROB", "0.65"))          # Only bet if model says ≥65% chance of winning
 V4_MAX_BUY_PRICE = float(os.getenv("V4_MAX_BUY_PRICE", "0.50"))       # Don't pay >$0.50 per share (better risk/reward)
+
+# Safety guards — prevent catastrophic losses
+V4_MAX_MODEL_MARKET_DISAGREE = float(os.getenv("V4_MAX_MODEL_MARKET_DISAGREE", "0.40"))  # Skip if model vs market >40pp
+V4_MAX_BID_OVER_MID_RATIO = float(os.getenv("V4_MAX_BID_OVER_MID_RATIO", "3.0"))        # Never bid >3x mid-price
 
 # Logging
 LOG_DIR = Path("data")
@@ -473,10 +477,17 @@ class OrderManager:
         # Clamp to valid range — also enforce max buy price for risk/reward
         bid_price = max(0.01, min(bid_price, V4_MAX_ENTRY_PRICE, V4_MAX_BUY_PRICE))
 
-        # Don't bid above the current mid-price (don't overpay)
+        # ── Bid-over-mid cap: never bid more than 3x market mid-price ──
+        # If market says NO is $0.004, max bid is $0.012, not $0.50.
+        # This prevents catastrophic overpayment on already-settled markets.
         mid_price = score.buy_price
+        if mid_price > 0.001:
+            max_bid_from_mid = round(mid_price * V4_MAX_BID_OVER_MID_RATIO, 3)
+            if bid_price > max_bid_from_mid:
+                bid_price = max_bid_from_mid
+
+        # Also don't bid above the current mid-price if it's meaningful
         if bid_price > mid_price and mid_price > 0.01:
-            # Bid at mid-price — still has edge since model_prob > mid + fee
             bid_price = round(mid_price, 2)
 
         # Verify we still have edge at our bid
@@ -549,6 +560,83 @@ class OrderManager:
             log_trade(f"ERROR: {score.question[:50]} | {e}")
             return None
 
+    def execute_fok_order(self, client, score: BracketScore, bankroll: Bankroll,
+                          event_slug: str = "", market_type: str = "") -> bool:
+        """Execute a Fill-or-Kill order (for weather markets — take liquidity, don't provide it).
+
+        Weather forecasts update frequently, so passive limit orders get picked off.
+        FOK orders either fill instantly at the ask or get rejected — no stale exposure.
+        """
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY
+
+        model_prob = score.model_prob_yes if score.best_side == "yes" else (1 - score.model_prob_yes)
+
+        # For FOK, we need to buy at the ASK (not bid). Use the market price.
+        ask_price = score.buy_price
+        if ask_price <= 0.01 or ask_price >= 0.99:
+            return False
+
+        # Verify edge at ask
+        edge_at_ask = model_prob - ask_price - POLYMARKET_FEE
+        if edge_at_ask < V4_MIN_EDGE_WEATHER:
+            return False
+
+        # Kelly sizing
+        bet_amt = kelly_bet_size(edge_at_ask, ask_price, bankroll.balance, win_prob=model_prob)
+        size = max(5, math.floor((bet_amt / ask_price) * 100) / 100)
+        actual_cost = ask_price * size
+
+        if actual_cost > bankroll.balance:
+            size = math.floor((bankroll.balance / ask_price) * 100) / 100
+            if size < 5:
+                return False
+            actual_cost = ask_price * size
+
+        try:
+            order_args = OrderArgs(
+                token_id=score.token_id,
+                price=ask_price,
+                size=size,
+                side=BUY,
+            )
+            signed_order = client.create_order(order_args)
+            response = client.post_order(signed_order, OrderType.FOK)
+
+            order_id = ""
+            if isinstance(response, dict):
+                order_id = response.get("orderID", response.get("id", ""))
+                success = response.get("success", True)
+            else:
+                order_id = str(response)
+                success = True
+
+            if not success:
+                console.print(f"[dim][v4] FOK not filled: {score.question[:40]}[/dim]")
+                return False
+
+            # Record in bankroll
+            bankroll.place_bet(
+                amount=actual_cost,
+                score=score,
+                order_id=order_id,
+                shares=size,
+                event_slug=event_slug,
+                market_type=market_type,
+            )
+
+            msg = (
+                f"⚡ FOK FILLED: {score.question[:50]} {score.best_side.upper()} "
+                f"@ ${ask_price:.3f} | {size:.1f} shares | ${actual_cost:.2f} USDC"
+            )
+            console.print(f"[bold green][v4] {msg}[/bold green]")
+            log_trade(msg)
+            return True
+
+        except Exception as e:
+            console.print(f"[dim][v4] FOK order failed: {e}[/dim]")
+            return False
+
     def _cancel_all_safe(self, client):
         """Fallback: cancel all orders for this account."""
         try:
@@ -604,15 +692,24 @@ def score_weather_event(event: BracketEvent, forecast: CityForecast) -> list[Bra
         if not market.is_active:
             continue
 
+        # Get forecast temp in the right unit
+        if forecast.unit == market.threshold_unit:
+            temp = forecast.high_temp
+        elif market.threshold_unit == "°F":
+            temp = forecast.high_temp_f
+        else:
+            temp = forecast.high_temp_c
+
         model_prob = weather_bracket_prob(
-            forecast_temp=forecast.high_temp if forecast.unit == market.threshold_unit
-                else (forecast.high_temp_f if market.threshold_unit == "°F" else forecast.high_temp_c),
+            forecast_temp=temp,
             bracket_low=market.threshold,
             bracket_high=market.threshold_high,
             bracket_type=market.bracket_type,
             hours_remaining=market.hours_remaining,
             source=forecast.source,
             unit=market.threshold_unit,
+            confidence=forecast.confidence,
+            forecast_std_override=forecast.forecast_std,
         )
 
         s = score_bracket(
@@ -635,7 +732,7 @@ def score_weather_event(event: BracketEvent, forecast: CityForecast) -> list[Bra
 async def run_bracket_bot():
     """Main v4 bracket bot loop."""
     console.print("[bold cyan]" + "=" * 60 + "[/bold cyan]")
-    console.print("[bold cyan]  Polymarket Bracket Bot v4.2[/bold cyan]")
+    console.print("[bold cyan]  Polymarket Bracket Bot v4.3[/bold cyan]")
     console.print("[bold cyan]  Weather + BTC/ETH Daily Brackets[/bold cyan]")
     console.print("[bold cyan]" + "=" * 60 + "[/bold cyan]")
     console.print()
@@ -653,6 +750,12 @@ async def run_bracket_bot():
     console.print(f"  Drawdown limit:  {Bankroll.MAX_DRAWDOWN_PCT:.0%}")
     console.print(f"  Min win prob:    {V4_MIN_WIN_PROB:.0%} (only bet when likely to win)")
     console.print(f"  Max buy price:   ${V4_MAX_BUY_PRICE:.2f} (cheap shares = better upside)")
+    console.print(f"  Max disagreement:{V4_MAX_MODEL_MARKET_DISAGREE:.0%} (model vs market sanity check)")
+    console.print(f"  Max bid/mid:     {V4_MAX_BID_OVER_MID_RATIO:.0f}x (bid-over-mid cap)")
+    console.print(f"  Weather orders:  FOK (take liquidity)")
+    console.print(f"  Crypto orders:   GTC limit (provide liquidity)")
+    console.print(f"  Timezone guard:  ON (skip cities past 4 PM local)")
+    console.print(f"  Multi-model:     ON (NOAA + Open-Meteo ensemble for US)")
     console.print()
 
     # VPN check
@@ -770,10 +873,25 @@ async def run_bracket_bot():
                     all_scores.append((s, event))
 
             # Weather scoring
+            skipped_tz = 0
             for event in weather_events:
                 city = event.coin
                 target_date = event.resolution_date.isoformat()
-                forecast = get_forecast(city, target_date)
+
+                # ── Timezone guard: skip cities where observation period is over ──
+                # If the city's local time is past 4 PM, the high is already known.
+                # Our forecast model can't compete with real-time market info.
+                if is_observation_complete(city, target_date):
+                    # Try to get actual observation — if we have it, we can bet WITH it
+                    forecast = get_forecast(city, target_date)
+                    if forecast and forecast.is_observation:
+                        # Great — we have the actual data, we're the smart money now
+                        console.print(f"  [green]📡 {city}: Using observation ({forecast.high_temp:.1f}{forecast.unit})[/green]")
+                    else:
+                        skipped_tz += 1
+                        continue  # No observation, skip — market knows more than us
+                else:
+                    forecast = get_forecast(city, target_date)
 
                 if forecast is None:
                     continue
@@ -782,9 +900,13 @@ async def run_bracket_bot():
                 for s in scores:
                     all_scores.append((s, event))
 
+            if skipped_tz:
+                console.print(f"  [dim]⏰ Skipped {skipped_tz} cities (past observation peak)[/dim]")
+
             # ── 3. Find best opportunities ──
-            # Filter by: edge threshold, win probability, and max buy price
+            # Filter by: edge threshold, win probability, max buy price, and sanity checks
             tradeable = []
+            skipped_disagree = 0
             for s, e in all_scores:
                 min_edge = V4_MIN_EDGE_WEATHER if e.market_type == "weather" else V4_MIN_EDGE_CRYPTO
                 if s.best_edge < min_edge:
@@ -798,12 +920,22 @@ async def run_bracket_bot():
                     continue
 
                 # Don't overpay — cheap shares have better risk/reward
-                # Paying $0.80 for NO risks $0.80 to make $0.20 (terrible)
-                # Paying $0.30 for YES risks $0.30 to make $0.70 (great)
                 if s.buy_price > V4_MAX_BUY_PRICE:
                     continue
 
+                # ── Model-vs-market sanity check ──
+                # If model and market disagree by >40pp, the market probably knows something.
+                # This prevents betting against already-known outcomes.
+                market_prob = s.poly_yes_price if s.best_side == "yes" else s.poly_no_price
+                disagreement = abs(win_prob - market_prob)
+                if disagreement > V4_MAX_MODEL_MARKET_DISAGREE:
+                    skipped_disagree += 1
+                    continue
+
                 tradeable.append((s, e))
+
+            if skipped_disagree:
+                console.print(f"  [dim]⚠️ Skipped {skipped_disagree} bets (model vs market disagree >{V4_MAX_MODEL_MARKET_DISAGREE:.0%})[/dim]")
 
             # Sort by expected value (edge × win_prob), not just edge
             # This favors high-probability bets that compound
@@ -872,25 +1004,37 @@ async def run_bracket_bot():
                     if event_traded >= V4_MAX_TRADES_PER_EVENT:
                         continue
 
-                    # Post limit order
-                    order = order_mgr.post_limit_order(
-                        client, score, bankroll,
-                        event_slug=event.slug,
-                        market_type=event.market_type,
-                    )
-
-                    if order:
-                        orders_posted += 1
-                        cycle_spent += order.cost
-                        if event.market_type == "weather":
+                    # ── Order routing: FOK for weather (take liquidity), GTC for crypto ──
+                    if event.market_type == "weather":
+                        # Weather: FOK — fills instantly or not at all. No stale exposure.
+                        filled = order_mgr.execute_fok_order(
+                            client, score, bankroll,
+                            event_slug=event.slug,
+                            market_type=event.market_type,
+                        )
+                        if filled:
+                            orders_posted += 1
                             weather_count += 1
-                        else:
+                    else:
+                        # Crypto: GTC limit order — slower-moving, passive liquidity is fine
+                        order = order_mgr.post_limit_order(
+                            client, score, bankroll,
+                            event_slug=event.slug,
+                            market_type=event.market_type,
+                        )
+                        if order:
+                            orders_posted += 1
+                            cycle_spent += order.cost
                             crypto_count += 1
 
                 if orders_posted:
+                    parts = []
+                    if weather_count:
+                        parts.append(f"{weather_count} FOK weather")
+                    if crypto_count:
+                        parts.append(f"{crypto_count} GTC crypto")
                     console.print(
-                        f"  [cyan]📋 {orders_posted} limit orders posted "
-                        f"({weather_count}W/{crypto_count}C) | "
+                        f"  [cyan]📋 {orders_posted} orders ({', '.join(parts)}) | "
                         f"${order_mgr.total_locked:.2f} USDC on book[/cyan]"
                     )
 
