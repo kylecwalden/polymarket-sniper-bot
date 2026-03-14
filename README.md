@@ -192,7 +192,7 @@ If this bot makes you money, consider tipping the developer:
 ## Helpful Links
 
 - [Sign up for Polymarket](https://polymarket.com) — *replace with your referral link from [partners.dub.co/polymarket](https://partners.dub.co/polymarket)*
-- [Get ProtonVPN](https://proton.me/refer-a-friend) — *replace with your referral link from [proton.me/refer-a-friend](https://proton.me/refer-a-friend)*
+- [Get ProtonVPN](https://pr.tn/ref/WMF7NFH4) — Free VPN required for trading
 - [Allium Data Platform](https://app.allium.so) — On-chain intelligence (optional)
 
 ## Disclaimer
