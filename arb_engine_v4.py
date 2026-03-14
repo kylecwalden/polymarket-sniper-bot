@@ -86,20 +86,40 @@ def save_trade_record(trade: dict):
 # --- Bankroll (adapted from v3.5) ---
 
 class Bankroll:
-    """Dynamic bankroll for daily bracket trading."""
+    """Dynamic bankroll for daily bracket trading with downside protection."""
+
+    # ── Circuit breaker thresholds ──
+    MAX_DRAWDOWN_PCT = 0.50       # Stop trading if 50% of starting bankroll lost
+    LOSS_STREAK_LIMIT = 5         # Pause after 5 consecutive losses
+    LOSS_STREAK_COOLDOWN = 1800   # 30 min cooldown after loss streak (seconds)
+    MIN_WIN_RATE_TRADES = 10      # Start checking win rate after 10 trades
+    MIN_WIN_RATE = 0.30           # If win rate drops below 30% after 10+ trades, halt
 
     def __init__(self, starting: float):
         self.starting = starting
         self.balance = starting
+        self.high_water_mark = starting  # Track peak balance
         self.total_wagered = 0.0
         self.wins = 0
         self.losses = 0
+        self.loss_streak = 0             # Consecutive losses
+        self.max_loss_streak = 0         # Worst streak ever
+        self.loss_streak_paused_until = 0.0  # Timestamp when cooldown ends
         self.pending_trades: list[dict] = []
-        self.traded_slugs: set[str] = set()  # Track which market slugs we've traded
+        self.traded_slugs: set[str] = set()
+        self._circuit_broken = False
+        self._circuit_reason = ""
 
     @property
     def pnl(self) -> float:
         return self.balance - self.starting
+
+    @property
+    def drawdown(self) -> float:
+        """Current drawdown from high water mark (0.0 to 1.0)."""
+        if self.high_water_mark <= 0:
+            return 0.0
+        return max(0, (self.high_water_mark - self.balance) / self.high_water_mark)
 
     @property
     def win_rate(self) -> float:
@@ -108,7 +128,46 @@ class Bankroll:
 
     @property
     def can_trade(self) -> bool:
-        return self.balance >= V4_MIN_BET
+        """Check all bankroll guards before allowing a trade."""
+        # Basic: enough balance
+        if self.balance < V4_MIN_BET:
+            return False
+
+        # Circuit breaker tripped
+        if self._circuit_broken:
+            return False
+
+        # Max drawdown guard
+        if self.drawdown >= self.MAX_DRAWDOWN_PCT:
+            self._trip_circuit(f"Max drawdown hit ({self.drawdown:.0%} from ${self.high_water_mark:.2f})")
+            return False
+
+        # Loss streak cooldown
+        if self.loss_streak >= self.LOSS_STREAK_LIMIT:
+            if time.time() < self.loss_streak_paused_until:
+                return False
+            else:
+                # Cooldown expired, reset streak and continue
+                console.print(f"[yellow][v4] Loss streak cooldown expired. Resuming trading.[/yellow]")
+                self.loss_streak = 0
+
+        # Win rate guard (only after enough trades)
+        total = self.wins + self.losses
+        if total >= self.MIN_WIN_RATE_TRADES and self.win_rate < self.MIN_WIN_RATE:
+            self._trip_circuit(f"Win rate too low ({self.win_rate:.0%} after {total} trades)")
+            return False
+
+        return True
+
+    def _trip_circuit(self, reason: str):
+        """Trip the circuit breaker — stops all trading."""
+        if not self._circuit_broken:
+            self._circuit_broken = True
+            self._circuit_reason = reason
+            console.print(f"[bold red]🚨 CIRCUIT BREAKER: {reason}[/bold red]")
+            console.print(f"[red]   Trading halted. Review performance before restarting.[/red]")
+            tg.send_message(f"🚨 V4 CIRCUIT BREAKER\n{reason}\nBankroll: ${self.balance:.2f}\nP&L: {self.pnl:+.2f}\nWin rate: {self.win_rate:.0%}")
+            log_trade(f"CIRCUIT BREAKER: {reason} | Balance: ${self.balance:.2f} | P&L: ${self.pnl:+.2f}")
 
     def already_traded(self, slug: str) -> bool:
         return slug in self.traded_slugs
@@ -162,19 +221,29 @@ class Bankroll:
         )
 
     def resolve_trade(self, won: bool, trade: dict, payout: float = 0):
-        """Resolve a completed trade."""
+        """Resolve a completed trade with streak tracking."""
         label = trade.get("coin", "?")[:30]
         if won:
             self.wins += 1
             self.balance += payout
+            self.loss_streak = 0  # Reset loss streak on any win
+            self.high_water_mark = max(self.high_water_mark, self.balance)
             msg = f"WIN: {label} {trade['side'].upper()} | Bet ${trade['amount']:.2f} → Payout ${payout:.2f} | Bankroll: ${self.balance:.2f}"
             console.print(f"[bold green][v4] {msg}[/bold green]")
             tg.alert_win(label, trade["side"], trade["amount"], payout, self.balance)
         else:
             self.losses += 1
-            msg = f"LOSS: {label} {trade['side'].upper()} | Lost ${trade['amount']:.2f} | Bankroll: ${self.balance:.2f}"
+            self.loss_streak += 1
+            self.max_loss_streak = max(self.max_loss_streak, self.loss_streak)
+            msg = f"LOSS: {label} {trade['side'].upper()} | Lost ${trade['amount']:.2f} | Bankroll: ${self.balance:.2f} | Streak: {self.loss_streak}"
             console.print(f"[red][v4] {msg}[/red]")
             tg.alert_loss(label, trade["side"], trade["amount"], self.balance)
+
+            # Trigger loss streak cooldown
+            if self.loss_streak >= self.LOSS_STREAK_LIMIT:
+                self.loss_streak_paused_until = time.time() + self.LOSS_STREAK_COOLDOWN
+                console.print(f"[yellow]⚠️ {self.loss_streak} consecutive losses — pausing for {self.LOSS_STREAK_COOLDOWN // 60} min cooldown[/yellow]")
+                tg.send_message(f"⚠️ V4 LOSS STREAK: {self.loss_streak} in a row\nPausing {self.LOSS_STREAK_COOLDOWN // 60} min\nBankroll: ${self.balance:.2f}")
 
         log_trade(msg)
         save_trade_record({
@@ -216,11 +285,15 @@ class Bankroll:
     def status_line(self) -> str:
         pnl = self.pnl
         pnl_color = "green" if pnl >= 0 else "red"
+        dd_str = f" | DD: {self.drawdown:.0%}" if self.drawdown > 0.05 else ""
+        streak_str = f" | L-streak: {self.loss_streak}" if self.loss_streak >= 2 else ""
+        circuit_str = " | 🚨 HALTED" if self._circuit_broken else ""
         return (
             f"Bankroll: ${self.balance:.2f} | "
             f"P&L: [{pnl_color}]${pnl:+.2f}[/{pnl_color}] | "
             f"W/L: {self.wins}/{self.losses} ({self.win_rate:.0%}) | "
             f"Pending: {len(self.pending_trades)}"
+            f"{dd_str}{streak_str}{circuit_str}"
         )
 
 

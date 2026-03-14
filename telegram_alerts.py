@@ -38,6 +38,11 @@ def _send_async(text: str):
     threading.Thread(target=_do_send, daemon=True).start()
 
 
+def send_message(text: str):
+    """Send a custom message via Telegram (for circuit breakers, status, etc.)."""
+    _send_async(text)
+
+
 def alert_trade(coin: str, side: str, price: float, amount: float, edge: float, secs_left: int, bankroll: float):
     """Alert when a trade is placed."""
     emoji = "🟢" if side == "up" else "🔴"
