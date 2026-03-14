@@ -69,6 +69,10 @@ V4_MIN_HOURS_TO_RESOLUTION = float(os.getenv("V4_MIN_HOURS_TO_RESOLUTION", "6.0"
 V4_MIN_EDGE_WEATHER = float(os.getenv("V4_MIN_EDGE_WEATHER", "0.20"))  # 20% for weather (model uncertainty)
 V4_MIN_EDGE_CRYPTO = float(os.getenv("V4_MIN_EDGE_CRYPTO", "0.10"))    # 10% for crypto (vol model is tighter)
 
+# Win-rate optimization — favor bets we're likely to WIN
+V4_MIN_WIN_PROB = float(os.getenv("V4_MIN_WIN_PROB", "0.65"))          # Only bet if model says ≥65% chance of winning
+V4_MAX_BUY_PRICE = float(os.getenv("V4_MAX_BUY_PRICE", "0.50"))       # Don't pay >$0.50 per share (better risk/reward)
+
 # Logging
 LOG_DIR = Path("data")
 LOG_FILE = LOG_DIR / "v4_trades.log"
@@ -313,15 +317,27 @@ class Bankroll:
 
 # --- Kelly Sizing ---
 
-def kelly_bet_size(edge: float, buy_price: float, bankroll: float) -> float:
-    """Kelly criterion bet sizing for binary bracket markets."""
+def kelly_bet_size(edge: float, buy_price: float, bankroll: float, win_prob: float = 0.5) -> float:
+    """Kelly criterion bet sizing for binary bracket markets.
+
+    Scales up for high-conviction bets: if win_prob ≥ 80%, use 2x Kelly fraction.
+    More wins → bigger bankroll → bigger bets → compounding machine.
+    """
     if edge <= 0 or buy_price >= 0.99:
         return V4_MIN_BET
 
     kelly_f = edge / (1.0 - buy_price)
     kelly_f = max(0.0, min(kelly_f, 0.50))
 
-    bet = bankroll * kelly_f * V4_KELLY_FRACTION
+    # Scale Kelly fraction based on conviction
+    # High win probability = more confident = bet more
+    fraction = V4_KELLY_FRACTION
+    if win_prob >= 0.85:
+        fraction = V4_KELLY_FRACTION * 2.5    # Very high conviction → 25% Kelly
+    elif win_prob >= 0.75:
+        fraction = V4_KELLY_FRACTION * 1.5    # High conviction → 15% Kelly
+
+    bet = bankroll * kelly_f * fraction
     return round(max(V4_MIN_BET, min(bet, V4_MAX_BET)), 2)
 
 
@@ -454,8 +470,8 @@ class OrderManager:
         # Bid at model_prob minus fee minus 2% buffer (keeps ~2% edge minimum)
         bid_price = round(model_prob - POLYMARKET_FEE - 0.02, 2)
 
-        # Clamp to valid range
-        bid_price = max(0.01, min(bid_price, V4_MAX_ENTRY_PRICE))
+        # Clamp to valid range — also enforce max buy price for risk/reward
+        bid_price = max(0.01, min(bid_price, V4_MAX_ENTRY_PRICE, V4_MAX_BUY_PRICE))
 
         # Don't bid above the current mid-price (don't overpay)
         mid_price = score.buy_price
@@ -468,8 +484,8 @@ class OrderManager:
         if edge_at_bid < V4_MIN_EDGE:
             return None
 
-        # Kelly sizing at our bid price
-        bet_amt = kelly_bet_size(edge_at_bid, bid_price, bankroll.balance)
+        # Kelly sizing at our bid price — scales up for high-conviction bets
+        bet_amt = kelly_bet_size(edge_at_bid, bid_price, bankroll.balance, win_prob=model_prob)
 
         raw_size = bet_amt / bid_price
         size = max(MIN_SHARES, math.floor(raw_size * 100) / 100)
@@ -635,6 +651,8 @@ async def run_bracket_bot():
     console.print(f"  Max positions:   {V4_MAX_OPEN_POSITIONS} total ({V4_MAX_WEATHER_PER_CYCLE}W/{V4_MAX_CRYPTO_PER_CYCLE}C per cycle)")
     console.print(f"  Skip if <{V4_MIN_HOURS_TO_RESOLUTION:.0f}h to resolution")
     console.print(f"  Drawdown limit:  {Bankroll.MAX_DRAWDOWN_PCT:.0%}")
+    console.print(f"  Min win prob:    {V4_MIN_WIN_PROB:.0%} (only bet when likely to win)")
+    console.print(f"  Max buy price:   ${V4_MAX_BUY_PRICE:.2f} (cheap shares = better upside)")
     console.print()
 
     # VPN check
@@ -765,27 +783,47 @@ async def run_bracket_bot():
                     all_scores.append((s, event))
 
             # ── 3. Find best opportunities ──
-            all_scores.sort(key=lambda x: x[0].best_edge, reverse=True)
-
-            # Per-category edge thresholds — weather needs higher edge due to model uncertainty
+            # Filter by: edge threshold, win probability, and max buy price
             tradeable = []
             for s, e in all_scores:
                 min_edge = V4_MIN_EDGE_WEATHER if e.market_type == "weather" else V4_MIN_EDGE_CRYPTO
-                if s.best_edge >= min_edge:
-                    tradeable.append((s, e))
+                if s.best_edge < min_edge:
+                    continue
+
+                # Win probability = model prob of the side we're betting on
+                win_prob = s.model_prob_yes if s.best_side == "yes" else (1 - s.model_prob_yes)
+
+                # Only bet when we're LIKELY to win (≥65%)
+                if win_prob < V4_MIN_WIN_PROB:
+                    continue
+
+                # Don't overpay — cheap shares have better risk/reward
+                # Paying $0.80 for NO risks $0.80 to make $0.20 (terrible)
+                # Paying $0.30 for YES risks $0.30 to make $0.70 (great)
+                if s.buy_price > V4_MAX_BUY_PRICE:
+                    continue
+
+                tradeable.append((s, e))
+
+            # Sort by expected value (edge × win_prob), not just edge
+            # This favors high-probability bets that compound
+            tradeable.sort(key=lambda x: x[0].best_edge * (
+                x[0].model_prob_yes if x[0].best_side == "yes" else (1 - x[0].model_prob_yes)
+            ), reverse=True)
+
             if tradeable:
-                console.print(f"\n  [green]📊 {len(tradeable)} opportunities with edge ≥ {V4_MIN_EDGE:.0%}:[/green]")
+                console.print(f"\n  [green]📊 {len(tradeable)} high-conviction opportunities:[/green]")
                 for s, e in tradeable[:10]:
                     icon = "₿" if e.market_type == "crypto" else "🌡️"
+                    win_p = s.model_prob_yes if s.best_side == "yes" else (1 - s.model_prob_yes)
                     already = " [traded]" if bankroll.already_traded(s.slug) else ""
                     console.print(
-                        f"    {icon} {s.question[:55]:55s} "
+                        f"    {icon} {s.question[:50]:50s} "
                         f"{s.best_side.upper():3s} @ ${s.buy_price:.3f} | "
-                        f"Model: {s.model_prob_yes:.1%} Poly: {s.poly_yes_price:.3f} | "
-                        f"Edge: {s.best_edge:+.1%}{already}"
+                        f"Win: {win_p:.0%} Edge: {s.best_edge:+.1%}{already}"
                     )
             else:
-                console.print(f"  [dim]No edges ≥ {V4_MIN_EDGE:.0%} found[/dim]")
+                console.print(f"  [dim]No bets pass filters (edge + win prob ≥{V4_MIN_WIN_PROB:.0%} + price ≤${V4_MAX_BUY_PRICE:.2f})[/dim]")
 
             # ── 4. Post fresh limit orders ──
             orders_posted = 0
