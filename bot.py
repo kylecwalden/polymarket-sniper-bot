@@ -187,9 +187,32 @@ def cmd_scan():
 
 
 def cmd_bracket():
-    """Run v4 bracket bot — weather + crypto daily brackets."""
+    """Run v5 bracket bot — weather GFS ensemble."""
     from arb_engine_v4 import main as bracket_main
     bracket_main()
+
+
+def cmd_maker():
+    """Run v5 crypto maker bot — 15-min market maker strategy."""
+    from arb_engine_v5_maker import main as maker_main
+    maker_main()
+
+
+def cmd_dual():
+    """Run weather bracket + crypto maker in parallel."""
+    import asyncio
+    from arb_engine_v4 import run_bracket_bot
+    from arb_engine_v5_maker import run_maker_bot
+
+    async def run_both():
+        console.print("[bold green]Starting DUAL mode: Weather + Crypto Maker[/bold green]")
+        console.print()
+        await asyncio.gather(
+            run_bracket_bot(),
+            run_maker_bot(),
+        )
+
+    asyncio.run(run_both())
 
 
 def cmd_positions():
@@ -209,6 +232,8 @@ def main():
         "scan": cmd_scan,
         "positions": cmd_positions,
         "bracket": cmd_bracket,
+        "maker": cmd_maker,
+        "dual": cmd_dual,
     }
 
     if cmd in commands:
@@ -218,8 +243,10 @@ def main():
         console.print()
         console.print("Usage:")
         console.print("  python bot.py scan        # Preview cheap outcomes (no buying)")
-        console.print("  python bot.py run         # Start v3.5 bot (15-min crypto arb)")
-        console.print("  python bot.py bracket     # Start v4 bot (daily brackets: weather + crypto)")
+        console.print("  python bot.py run         # Start v3.5 bot (15-min crypto arb, DEPRECATED)")
+        console.print("  python bot.py bracket     # Start v5 weather bot (GFS ensemble)")
+        console.print("  python bot.py maker       # Start v5 crypto maker (15-min markets)")
+        console.print("  python bot.py dual        # Run weather + crypto maker in parallel")
         console.print("  python bot.py positions   # Show positions and P&L")
 
 

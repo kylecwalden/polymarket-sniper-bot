@@ -562,18 +562,42 @@ class OrderManager:
 
         Weather forecasts update frequently, so passive limit orders get picked off.
         FOK orders either fill instantly at the ask or get rejected — no stale exposure.
+
+        v5.0 fix: Fetch REAL orderbook ask price instead of using Gamma midpoint.
+        The midpoint often doesn't match any resting ask, causing FOK to fail.
         """
         from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY
 
         model_prob = score.model_prob_yes if score.best_side == "yes" else (1 - score.model_prob_yes)
 
-        # For FOK, we need to buy at the ASK (not bid). Use the market price.
-        ask_price = score.buy_price
+        # ── Fetch REAL best ask from orderbook ──
+        # The Gamma API "price" is a midpoint estimate; the CLOB orderbook has real resting orders.
+        # FOK must match an actual ask price to fill.
+        ask_price = score.buy_price  # Fallback to Gamma midpoint
+        try:
+            book = client.get_order_book(score.token_id)
+            asks = book.get("asks", []) if isinstance(book, dict) else getattr(book, "asks", [])
+            if asks:
+                # Best (lowest) ask price
+                best_ask = min(float(a.get("price", a.price) if isinstance(a, dict) else a.price) for a in asks)
+                if 0.01 < best_ask < 0.99:
+                    ask_price = best_ask
+                    # Also check available size at this level
+                    ask_size = sum(
+                        float(a.get("size", a.size) if isinstance(a, dict) else a.size)
+                        for a in asks
+                        if float(a.get("price", a.price) if isinstance(a, dict) else a.price) == best_ask
+                    )
+                    if ask_size < 5:
+                        console.print(f"[dim][v4] Thin book ({ask_size:.0f} shares at ${best_ask:.3f}): {score.question[:30]}[/dim]")
+        except Exception as e:
+            console.print(f"[dim][v4] Orderbook fetch failed, using midpoint: {e}[/dim]")
+
         if ask_price <= 0.01 or ask_price >= 0.99:
             return False
 
-        # Verify edge at ask
+        # Verify edge at REAL ask price
         edge_at_ask = model_prob - ask_price - POLYMARKET_FEE
         if edge_at_ask < V4_MIN_EDGE_WEATHER:
             return False
@@ -608,7 +632,7 @@ class OrderManager:
                 success = True
 
             if not success:
-                console.print(f"[dim][v4] FOK not filled: {score.question[:40]}[/dim]")
+                console.print(f"[dim][v4] FOK not filled @ ${ask_price:.3f}: {score.question[:40]}[/dim]")
                 return False
 
             # Record in bankroll
