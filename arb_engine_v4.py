@@ -1,18 +1,17 @@
 """
-Bracket Market Engine v4.3
-Trades daily BTC/ETH price brackets and weather temperature brackets.
+Bracket Market Engine v5.0 — Weather-Only (GFS Ensemble)
 
-v4.1 changes (limit order hybrid):
-- Posts GTC limit orders at model-fair price instead of FOK
-- Cancels and refreshes all open orders every scan cycle
-- Detects fills between cycles and records them in bankroll
-- Eliminates the "edge too thin at ask" problem — we make the market
+Trades daily weather temperature brackets using the GFS 31-member ensemble
+from Open-Meteo. Each ensemble member provides an independent max-temp forecast;
+we count how many land in each bracket to get a probability.
 
-Unlike v3.5 (15-min latency arb), v4 uses:
-- Log-normal volatility model for crypto brackets
-- NOAA/Open-Meteo forecast model for weather brackets
-- Allium on-chain data for crypto signal boost
-- Scans every 5 minutes instead of every second
+v5.0 changes:
+- Removed all crypto trading (BTC/ETH brackets, Binance feed, Allium)
+- Primary model: GFS 31-member ensemble counting
+- Fallback: NOAA/Open-Meteo single forecast + normal distribution
+- Edge threshold lowered to 8% (from 20%) — ensemble is more reliable
+- Max weather bets per cycle raised to 6
+- Skip single-degree brackets (too noisy)
 """
 
 import asyncio
@@ -32,11 +31,11 @@ from bracket_markets import (
     discover_all_events, refresh_event_prices,
 )
 from bracket_model import (
-    crypto_bracket_prob, weather_bracket_prob,
-    estimate_volatility, score_bracket, BracketScore,
+    weather_bracket_prob, ensemble_bracket_prob,
+    score_bracket, BracketScore,
     POLYMARKET_FEE,
 )
-from noaa_feed import get_forecast, CityForecast, is_observation_complete
+from noaa_feed import get_forecast, get_ensemble_forecast, CityForecast, is_observation_complete
 from trader import init_client, PlacedOrder, save_order
 from vpn import ensure_vpn
 import telegram_alerts as tg
@@ -51,7 +50,6 @@ SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "1"))
 VPN_REQUIRED = os.getenv("PROTON_VPN_REQUIRED", "true").lower() == "true"
 
 # v4 Config
-V4_COINS = os.getenv("V4_COINS", "BTC,ETH").split(",")
 V4_MIN_EDGE = float(os.getenv("V4_MIN_EDGE", "0.15"))          # 15% minimum edge (raised from 5%)
 V4_SCAN_INTERVAL = int(os.getenv("V4_SCAN_INTERVAL", "300"))    # 5 min between scans
 V4_MAX_BET = float(os.getenv("V4_MAX_BET", "10.0"))             # Higher max for daily markets
@@ -60,14 +58,12 @@ V4_KELLY_FRACTION = float(os.getenv("V4_KELLY_FRACTION", "0.10"))
 V4_DAILY_BANKROLL = float(os.getenv("V4_DAILY_BANKROLL", "50.0"))
 V4_MAX_ENTRY_PRICE = float(os.getenv("V4_MAX_ENTRY_PRICE", "0.80"))
 V4_MAX_TRADES_PER_EVENT = int(os.getenv("V4_MAX_TRADES_PER_EVENT", "1"))
-V4_MAX_WEATHER_PER_CYCLE = int(os.getenv("V4_MAX_WEATHER_PER_CYCLE", "3"))
-V4_MAX_CRYPTO_PER_CYCLE = int(os.getenv("V4_MAX_CRYPTO_PER_CYCLE", "3"))
+V4_MAX_WEATHER_PER_CYCLE = int(os.getenv("V4_MAX_WEATHER_PER_CYCLE", "6"))
 V4_MAX_OPEN_POSITIONS = int(os.getenv("V4_MAX_OPEN_POSITIONS", "6"))
 V4_MIN_HOURS_TO_RESOLUTION = float(os.getenv("V4_MIN_HOURS_TO_RESOLUTION", "6.0"))
 
-# Per-category edge thresholds — weather and crypto are different beasts
-V4_MIN_EDGE_WEATHER = float(os.getenv("V4_MIN_EDGE_WEATHER", "0.20"))  # 20% for weather (model uncertainty)
-V4_MIN_EDGE_CRYPTO = float(os.getenv("V4_MIN_EDGE_CRYPTO", "0.10"))    # 10% for crypto (vol model is tighter)
+# Edge threshold — ensemble model is more reliable than single forecast
+V4_MIN_EDGE_WEATHER = float(os.getenv("V4_MIN_EDGE_WEATHER", "0.08"))  # 8% for weather (GFS ensemble)
 
 # Win-rate optimization — favor bets we're likely to WIN
 V4_MIN_WIN_PROB = float(os.getenv("V4_MIN_WIN_PROB", "0.65"))          # Only bet if model says ≥65% chance of winning
@@ -656,35 +652,6 @@ class OrderManager:
 
 # --- Scoring Engine ---
 
-def score_crypto_event(event: BracketEvent, current_price: float, volatility: float) -> list[BracketScore]:
-    """Score all brackets in a crypto event."""
-    scores = []
-    for market in event.markets:
-        if not market.is_active:
-            continue
-
-        model_prob = crypto_bracket_prob(
-            current_price=current_price,
-            threshold=market.threshold,
-            hours_remaining=market.hours_remaining,
-            volatility=volatility,
-        )
-
-        s = score_bracket(
-            question=market.question,
-            threshold=market.threshold,
-            model_prob_yes=model_prob,
-            poly_yes_price=market.yes_price,
-            poly_no_price=market.no_price,
-            yes_token_id=market.yes_token_id,
-            no_token_id=market.no_token_id,
-            slug=market.slug,
-        )
-        scores.append(s)
-
-    return scores
-
-
 def score_weather_event(event: BracketEvent, forecast: CityForecast) -> list[BracketScore]:
     """Score all brackets in a weather event."""
     scores = []
@@ -732,20 +699,19 @@ def score_weather_event(event: BracketEvent, forecast: CityForecast) -> list[Bra
 async def run_bracket_bot():
     """Main v4 bracket bot loop."""
     console.print("[bold cyan]" + "=" * 60 + "[/bold cyan]")
-    console.print("[bold cyan]  Polymarket Bracket Bot v4.3[/bold cyan]")
-    console.print("[bold cyan]  Weather + BTC/ETH Daily Brackets[/bold cyan]")
+    console.print("[bold cyan]  Polymarket Bracket Bot v5.0[/bold cyan]")
+    console.print("[bold cyan]  Weather-Only (GFS Ensemble)[/bold cyan]")
     console.print("[bold cyan]" + "=" * 60 + "[/bold cyan]")
     console.print()
 
     # Config display
-    console.print(f"  Coins:           {', '.join(V4_COINS)}")
-    console.print(f"  Min edge:        {V4_MIN_EDGE_CRYPTO:.0%} crypto / {V4_MIN_EDGE_WEATHER:.0%} weather")
+    console.print(f"  Min edge:        {V4_MIN_EDGE_WEATHER:.0%} weather (GFS ensemble)")
     console.print(f"  Scan interval:   {V4_SCAN_INTERVAL}s")
     console.print(f"  Bet range:       ${V4_MIN_BET:.0f}-${V4_MAX_BET:.0f}")
     console.print(f"  Daily bankroll:  ${V4_DAILY_BANKROLL:.0f}")
     console.print(f"  Kelly fraction:  {V4_KELLY_FRACTION:.0%}")
     console.print(f"  Max entry:       ${V4_MAX_ENTRY_PRICE}")
-    console.print(f"  Max positions:   {V4_MAX_OPEN_POSITIONS} total ({V4_MAX_WEATHER_PER_CYCLE}W/{V4_MAX_CRYPTO_PER_CYCLE}C per cycle)")
+    console.print(f"  Max positions:   {V4_MAX_OPEN_POSITIONS} total ({V4_MAX_WEATHER_PER_CYCLE} weather per cycle)")
     console.print(f"  Skip if <{V4_MIN_HOURS_TO_RESOLUTION:.0f}h to resolution")
     console.print(f"  Drawdown limit:  {Bankroll.MAX_DRAWDOWN_PCT:.0%}")
     console.print(f"  Min win prob:    {V4_MIN_WIN_PROB:.0%} (only bet when likely to win)")
@@ -753,9 +719,8 @@ async def run_bracket_bot():
     console.print(f"  Max disagreement:{V4_MAX_MODEL_MARKET_DISAGREE:.0%} (model vs market sanity check)")
     console.print(f"  Max bid/mid:     {V4_MAX_BID_OVER_MID_RATIO:.0f}x (bid-over-mid cap)")
     console.print(f"  Weather orders:  FOK (take liquidity)")
-    console.print(f"  Crypto orders:   GTC limit (provide liquidity)")
+    console.print(f"  Model:           GFS 31-member ensemble (fallback: forecast + normal)")
     console.print(f"  Timezone guard:  ON (skip cities past 4 PM local)")
-    console.print(f"  Multi-model:     ON (NOAA + Open-Meteo ensemble for US)")
     console.print()
 
     # VPN check
@@ -771,50 +736,7 @@ async def run_bracket_bot():
     # Init Bankroll
     bankroll = Bankroll(V4_DAILY_BANKROLL)
 
-    # Get Binance prices for crypto
-    from binance_feed import feed, connect_binance, get_initial_prices
-    binance_task = asyncio.create_task(connect_binance())
-    console.print("Fetching initial Binance prices...")
-    await asyncio.sleep(3)
-    prices = get_initial_prices()
-    for coin, price in prices.items():
-        console.print(f"  {coin}: ${price:,.2f}")
-    console.print()
-
-    # Allium init (optional — for crypto markets)
-    allium_enabled = False
-    try:
-        from allium_feed import allium
-        allium_ok = allium.test_connection()
-        if allium_ok:
-            allium_enabled = True
-            console.print("[allium] Connection OK — on-chain signals active for crypto")
-        else:
-            console.print("[yellow][allium] Connection failed — proceeding without on-chain data[/yellow]")
-    except Exception:
-        console.print("[yellow][allium] Not available — proceeding without on-chain data[/yellow]")
-
-    console.print()
-
-    # Volatility cache
-    vol_cache: dict[str, tuple[float, float]] = {}  # coin -> (vol, timestamp)
-    VOL_CACHE_TTL = 3600  # Refresh every hour
-
-    def get_volatility(coin: str) -> float:
-        cached = vol_cache.get(coin)
-        if cached and (time.time() - cached[1]) < VOL_CACHE_TTL:
-            return cached[0]
-        vol = estimate_volatility(coin)
-        vol_cache[coin] = (vol, time.time())
-        return vol
-
-    # Estimate initial volatility
-    for coin in V4_COINS:
-        vol = get_volatility(coin)
-        console.print(f"  {coin} volatility: {vol:.1%} annualized")
-    console.print()
-
-    # Order manager (v4.1 — hybrid limit orders)
+    # Order manager
     order_mgr = OrderManager()
 
     # Main loop
@@ -832,73 +754,74 @@ async def run_bracket_bot():
                 console.print(f"  [bold green]🎯 {fills} order(s) filled since last scan![/bold green]")
 
             # ── 1. Discover events ──
-            events = discover_all_events(V4_COINS)
+            events = discover_all_events()
 
-            crypto_events = [e for e in events if e.market_type == "crypto"]
             weather_events = [e for e in events if e.market_type == "weather"]
             console.print(
-                f"  Events: {len(crypto_events)} crypto, {len(weather_events)} weather"
+                f"  Events: {len(weather_events)} weather"
             )
 
-            if not events:
-                console.print("[yellow]  No active events found. Waiting...[/yellow]")
+            if not weather_events:
+                console.print("[yellow]  No active weather events found. Waiting...[/yellow]")
                 await asyncio.sleep(V4_SCAN_INTERVAL)
                 continue
 
             # ── 2. Score all brackets ──
             all_scores: list[tuple[BracketScore, BracketEvent]] = []
 
-            # Crypto scoring
-            for event in crypto_events:
-                coin = event.coin
-                binance_price = feed.get_price(coin)
-                if binance_price is None:
-                    continue
-
-                vol = get_volatility(coin)
-                scores = score_crypto_event(event, binance_price, vol)
-
-                # Apply Allium signal as edge boost/penalty
-                if allium_enabled:
-                    try:
-                        allium_sig = allium.get_bracket_signal(coin, event.slug)
-                        if allium_sig.has_flow_data or allium_sig.has_smart_data:
-                            console.print(f"  [dim][allium] {coin}: {allium_sig.summary()}[/dim]")
-                    except Exception:
-                        allium_sig = None
-                else:
-                    allium_sig = None
-
-                for s in scores:
-                    all_scores.append((s, event))
-
-            # Weather scoring
+            # Weather scoring — GFS ensemble first, fallback to forecast
             skipped_tz = 0
             for event in weather_events:
                 city = event.coin
                 target_date = event.resolution_date.isoformat()
 
-                # ── Timezone guard: skip cities where observation period is over ──
-                # If the city's local time is past 4 PM, the high is already known.
-                # Our forecast model can't compete with real-time market info.
+                # Timezone guard
                 if is_observation_complete(city, target_date):
-                    # Try to get actual observation — if we have it, we can bet WITH it
                     forecast = get_forecast(city, target_date)
                     if forecast and forecast.is_observation:
-                        # Great — we have the actual data, we're the smart money now
                         console.print(f"  [green]📡 {city}: Using observation ({forecast.high_temp:.1f}{forecast.unit})[/green]")
+                        scores = score_weather_event(event, forecast)
+                        for s in scores:
+                            all_scores.append((s, event))
+                        continue
                     else:
                         skipped_tz += 1
-                        continue  # No observation, skip — market knows more than us
+                        continue
+
+                # Try GFS ensemble first (31-member)
+                ensemble = get_ensemble_forecast(city, target_date)
+                if ensemble:
+                    for market in event.markets:
+                        if not market.is_active:
+                            continue
+                        # Skip single-degree brackets
+                        if market.bracket_type == "range":
+                            width = (market.threshold_high or market.threshold) - market.threshold
+                            if width <= 1:
+                                continue
+
+                        prob = ensemble_bracket_prob(
+                            ensemble, market.threshold, market.threshold_high,
+                            market.bracket_type, market.threshold_unit
+                        )
+                        s = score_bracket(
+                            question=market.question,
+                            threshold=market.threshold,
+                            model_prob_yes=prob,
+                            poly_yes_price=market.yes_price,
+                            poly_no_price=market.no_price,
+                            yes_token_id=market.yes_token_id,
+                            no_token_id=market.no_token_id,
+                            slug=market.slug,
+                        )
+                        all_scores.append((s, event))
                 else:
+                    # Fallback to single forecast
                     forecast = get_forecast(city, target_date)
-
-                if forecast is None:
-                    continue
-
-                scores = score_weather_event(event, forecast)
-                for s in scores:
-                    all_scores.append((s, event))
+                    if forecast:
+                        scores = score_weather_event(event, forecast)
+                        for s in scores:
+                            all_scores.append((s, event))
 
             if skipped_tz:
                 console.print(f"  [dim]⏰ Skipped {skipped_tz} cities (past observation peak)[/dim]")
@@ -908,8 +831,7 @@ async def run_bracket_bot():
             tradeable = []
             skipped_disagree = 0
             for s, e in all_scores:
-                min_edge = V4_MIN_EDGE_WEATHER if e.market_type == "weather" else V4_MIN_EDGE_CRYPTO
-                if s.best_edge < min_edge:
+                if s.best_edge < V4_MIN_EDGE_WEATHER:
                     continue
 
                 # Win probability = model prob of the side we're betting on
@@ -946,7 +868,7 @@ async def run_bracket_bot():
             if tradeable:
                 console.print(f"\n  [green]📊 {len(tradeable)} high-conviction opportunities:[/green]")
                 for s, e in tradeable[:10]:
-                    icon = "₿" if e.market_type == "crypto" else "🌡️"
+                    icon = "🌡️"
                     win_p = s.model_prob_yes if s.best_side == "yes" else (1 - s.model_prob_yes)
                     already = " [traded]" if bankroll.already_traded(s.slug) else ""
                     console.print(
@@ -964,9 +886,8 @@ async def run_bracket_bot():
                 cycle_budget = bankroll.balance
                 cycle_spent = 0.0
 
-                # Category counters — enforce diversification
+                # Category counters
                 weather_count = 0
-                crypto_count = 0
                 total_open = len(bankroll.pending_trades)  # Already-filled positions
 
                 for score, event in tradeable:
@@ -981,9 +902,7 @@ async def run_bracket_bot():
                         break
 
                     # Per-category limits
-                    if event.market_type == "weather" and weather_count >= V4_MAX_WEATHER_PER_CYCLE:
-                        continue
-                    if event.market_type == "crypto" and crypto_count >= V4_MAX_CRYPTO_PER_CYCLE:
+                    if weather_count >= V4_MAX_WEATHER_PER_CYCLE:
                         continue
 
                     # ── Skip markets resolving too soon (adverse selection risk) ──
@@ -1004,38 +923,19 @@ async def run_bracket_bot():
                     if event_traded >= V4_MAX_TRADES_PER_EVENT:
                         continue
 
-                    # ── Order routing: FOK for weather (take liquidity), GTC for crypto ──
-                    if event.market_type == "weather":
-                        # Weather: FOK — fills instantly or not at all. No stale exposure.
-                        filled = order_mgr.execute_fok_order(
-                            client, score, bankroll,
-                            event_slug=event.slug,
-                            market_type=event.market_type,
-                        )
-                        if filled:
-                            orders_posted += 1
-                            weather_count += 1
-                    else:
-                        # Crypto: GTC limit order — slower-moving, passive liquidity is fine
-                        order = order_mgr.post_limit_order(
-                            client, score, bankroll,
-                            event_slug=event.slug,
-                            market_type=event.market_type,
-                        )
-                        if order:
-                            orders_posted += 1
-                            cycle_spent += order.cost
-                            crypto_count += 1
+                    # ── Order routing: FOK for weather (take liquidity) ──
+                    filled = order_mgr.execute_fok_order(
+                        client, score, bankroll,
+                        event_slug=event.slug,
+                        market_type=event.market_type,
+                    )
+                    if filled:
+                        orders_posted += 1
+                        weather_count += 1
 
                 if orders_posted:
-                    parts = []
-                    if weather_count:
-                        parts.append(f"{weather_count} FOK weather")
-                    if crypto_count:
-                        parts.append(f"{crypto_count} GTC crypto")
                     console.print(
-                        f"  [cyan]📋 {orders_posted} orders ({', '.join(parts)}) | "
-                        f"${order_mgr.total_locked:.2f} USDC on book[/cyan]"
+                        f"  [cyan]📋 {orders_posted} FOK weather orders filled[/cyan]"
                     )
 
             # ── 5. Check resolutions ──

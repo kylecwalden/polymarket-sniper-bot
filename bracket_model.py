@@ -262,6 +262,70 @@ def weather_bracket_prob(
         return 0.5  # Unknown type
 
 
+# ── GFS Ensemble Bracket Probability ─────────────────────────────────
+
+def _c_to_f(temp_c: float) -> float:
+    """Convert Celsius to Fahrenheit."""
+    return temp_c * 9.0 / 5.0 + 32.0
+
+
+def ensemble_bracket_prob(
+    ensemble_maxes: list[float],
+    bracket_low: float,
+    bracket_high: float | None,
+    bracket_type: str,
+    unit: str,
+) -> float:
+    """Compute bracket probability by counting GFS ensemble members.
+
+    The ensemble API returns temperatures in °C. If the bracket is in °F,
+    we convert each ensemble member before comparing.
+
+    Args:
+        ensemble_maxes: List of max-temp values from ensemble (°C)
+        bracket_low: Lower bound / threshold
+        bracket_high: Upper bound (for range type) or None
+        bracket_type: "range", "at_or_below", "at_or_above"
+        unit: "°F" or "°C" — the unit of the bracket thresholds
+
+    Returns:
+        Probability between 0 and 1 (hits / total members)
+    """
+    if not ensemble_maxes:
+        return 0.5
+
+    # Convert ensemble temps to bracket unit if needed
+    if unit == "°F":
+        temps = [_c_to_f(t) for t in ensemble_maxes]
+    else:
+        temps = list(ensemble_maxes)
+
+    total = len(temps)
+    hits = 0
+
+    if bracket_type == "at_or_above":
+        # P(T >= threshold) — use threshold - 0.5 for rounding
+        cutoff = bracket_low - 0.5
+        hits = sum(1 for t in temps if t >= cutoff)
+
+    elif bracket_type == "at_or_below":
+        # P(T <= threshold) — use threshold + 0.5 for rounding
+        cutoff = bracket_low + 0.5
+        hits = sum(1 for t in temps if t <= cutoff)
+
+    elif bracket_type == "range":
+        if bracket_high is None:
+            bracket_high = bracket_low
+        low_cutoff = bracket_low - 0.5
+        high_cutoff = bracket_high + 0.5
+        hits = sum(1 for t in temps if low_cutoff <= t <= high_cutoff)
+
+    else:
+        return 0.5
+
+    return hits / total
+
+
 # ── Bracket Scoring ───────────────────────────────────────────────────
 
 @dataclass

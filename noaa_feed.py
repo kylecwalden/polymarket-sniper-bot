@@ -15,6 +15,7 @@ import requests
 
 NOAA_BASE = "https://api.weather.gov"
 OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
+ENSEMBLE_API_BASE = "https://ensemble-api.open-meteo.com/v1/ensemble"
 USER_AGENT = "PolymarketWeatherBot/1.0 (contact: bot@example.com)"
 
 # Cache forecasts for 30 minutes (they don't change often)
@@ -455,6 +456,93 @@ def _fetch_open_meteo_forecast(city: str, lat: float, lon: float) -> list[CityFo
     except Exception as e:
         print(f"[weather] Open-Meteo forecast failed for {city}: {e}")
         return []
+
+
+# ── GFS 31-Member Ensemble ────────────────────────────────────────────
+
+# Ensemble cache: key = "city|date" → (list[float], timestamp)
+_ensemble_cache: dict[str, tuple[list[float], float]] = {}
+
+
+def get_ensemble_forecast(city: str, target_date: str) -> list[float] | None:
+    """Fetch GFS 31-member ensemble max-temp forecasts for a city on a date.
+
+    Calls Open-Meteo's ensemble API with the GFS seamless model.
+    Returns a list of 31 float values (max temp in °C per ensemble member)
+    for the target date, or None on failure.
+
+    Args:
+        city: City name (must be in CITY_COORDS)
+        target_date: Date string "YYYY-MM-DD"
+
+    Returns:
+        List of 31 floats (°C) or None
+    """
+    cache_key = f"ens|{city}|{target_date}"
+    cached = _ensemble_cache.get(cache_key)
+    if cached and (time.time() - cached[1]) < CACHE_TTL:
+        return cached[0]
+
+    coords = _get_city_coords(city)
+    if not coords:
+        print(f"[weather] Unknown city for ensemble: {city}")
+        return None
+
+    lat, lon = coords[0], coords[1]
+
+    try:
+        resp = requests.get(
+            ENSEMBLE_API_BASE,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "models": "gfs_seamless",
+                "daily": "temperature_2m_max",
+                "forecast_days": 3,
+                "timezone": "auto",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+
+        # Find the target date index
+        try:
+            date_idx = dates.index(target_date)
+        except ValueError:
+            print(f"[weather] Ensemble: target date {target_date} not in response for {city}")
+            return None
+
+        # Collect max temps from all ensemble members
+        # The API returns keys like "temperature_2m_max_member01", ..., "temperature_2m_max_member30"
+        # plus "temperature_2m_max" for the control run (member 0)
+        members = []
+
+        # Control run
+        control = daily.get("temperature_2m_max")
+        if control and date_idx < len(control) and control[date_idx] is not None:
+            members.append(float(control[date_idx]))
+
+        # Perturbed members (01-30)
+        for i in range(1, 31):
+            key = f"temperature_2m_max_member{i:02d}"
+            member_data = daily.get(key)
+            if member_data and date_idx < len(member_data) and member_data[date_idx] is not None:
+                members.append(float(member_data[date_idx]))
+
+        if len(members) < 10:
+            print(f"[weather] Ensemble: only {len(members)} members for {city} (need ≥10)")
+            return None
+
+        _ensemble_cache[cache_key] = (members, time.time())
+        return members
+
+    except Exception as e:
+        print(f"[weather] Ensemble fetch failed for {city}: {e}")
+        return None
 
 
 # ── Public API ────────────────────────────────────────────────────────
