@@ -1020,17 +1020,50 @@ async def run_bracket_bot():
 
                 if orders_posted:
                     console.print(
-                        f"  [cyan]📋 {orders_posted} FOK weather orders filled[/cyan]"
+                        f"  [cyan]📋 {orders_posted} weather orders filled[/cyan]"
                     )
 
             # ── 5. Check resolutions ──
             if bankroll.pending_trades:
                 bankroll.check_pending_resolutions(client)
 
-            # ── 6. Status ──
+            # ── 6. Status + Telegram scan summary ──
             open_str = f" | Open: {order_mgr.count}" if order_mgr.count else ""
             console.print(f"\n  {bankroll.status_line()}{open_str}")
             console.print()
+
+            # Send human-readable Telegram update every 6 scans (~30 min)
+            # or immediately if we placed a trade
+            if orders_posted > 0 or scan_count % 6 == 0:
+                total_trades = bankroll.wins + bankroll.losses
+                wr = f"{bankroll.wins}/{total_trades} ({bankroll.win_rate:.0%})" if total_trades > 0 else "no trades yet"
+
+                # Build opportunity summary
+                opp_lines = []
+                for s, e in tradeable[:3]:
+                    wp = s.model_prob_yes if s.best_side == "yes" else (1 - s.model_prob_yes)
+                    city = s.question.split("in ")[-1].split(" be")[0] if "in " in s.question else s.question[:20]
+                    opp_lines.append(f"  {city}: {s.best_side.upper()} @ ${s.buy_price:.2f} ({wp:.0%} win, {s.best_edge:+.0%} edge)")
+
+                scan_msg = (
+                    f"📡 *Scan #{scan_count}*\n"
+                    f"Markets scanned: {len(all_events)} weather\n"
+                    f"Opportunities: {len(tradeable)} found"
+                )
+                if opp_lines:
+                    scan_msg += "\n" + "\n".join(opp_lines)
+                if orders_posted:
+                    scan_msg += f"\n✅ *{orders_posted} trade(s) placed!*"
+                if skipped_disagree:
+                    scan_msg += f"\n⚠️ {skipped_disagree} skipped (model vs market disagree)"
+
+                scan_msg += (
+                    f"\n\n💰 Bankroll: ${bankroll.balance:.2f} | P&L: ${bankroll.pnl:+.2f}\n"
+                    f"📊 Record: {wr}\n"
+                    f"⏳ Pending: {len(bankroll.pending_trades)} open position(s)"
+                )
+
+                tg.send_message(scan_msg)
 
             # ── 7. Sleep until next scan ──
             await asyncio.sleep(V4_SCAN_INTERVAL)

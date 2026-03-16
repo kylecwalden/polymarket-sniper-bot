@@ -45,31 +45,39 @@ def send_message(text: str):
 
 def alert_trade(coin: str, side: str, price: float, amount: float, edge: float, secs_left: int, bankroll: float):
     """Alert when a trade is placed."""
-    emoji = "🟢" if side == "up" else "🔴"
+    shares = int(amount / max(price, 0.01))
+    potential_profit = shares * (1.0 - price)
     _send_async(
-        f"{emoji} *TRADE* {coin} {side.upper()}\n"
-        f"Price: ${price:.3f} | ${amount:.2f} USDC\n"
-        f"Edge: {edge:.1%} | {secs_left}s left\n"
-        f"Bankroll: ${bankroll:.2f}"
+        f"🎯 *NEW TRADE PLACED*\n\n"
+        f"*{coin}*\n"
+        f"Betting: {side.upper()} @ ${price:.2f}/share\n"
+        f"Cost: ${amount:.2f} ({shares} shares)\n"
+        f"Edge: {edge:.1%} over market\n"
+        f"If we win: +${potential_profit:.2f} profit\n\n"
+        f"💰 Bankroll remaining: ${bankroll:.2f}"
     )
 
 
 def alert_win(coin: str, side: str, amount: float, payout: float, bankroll: float):
     """Alert when a trade wins."""
     profit = payout - amount
+    roi = (profit / amount * 100) if amount > 0 else 0
     _send_async(
-        f"✅ *WIN* {coin} {side.upper()}\n"
-        f"Bet ${amount:.2f} → Payout ${payout:.2f} (+${profit:.2f})\n"
-        f"Bankroll: ${bankroll:.2f}"
+        f"🏆 *WINNER!*\n\n"
+        f"*{coin}*\n"
+        f"Bet ${amount:.2f} → Won ${payout:.2f}\n"
+        f"Profit: +${profit:.2f} ({roi:.0f}% return)\n\n"
+        f"💰 Bankroll: ${bankroll:.2f}"
     )
 
 
 def alert_loss(coin: str, side: str, amount: float, bankroll: float):
     """Alert when a trade loses."""
     _send_async(
-        f"❌ *LOSS* {coin} {side.upper()}\n"
-        f"Lost ${amount:.2f}\n"
-        f"Bankroll: ${bankroll:.2f}"
+        f"💔 *LOSS*\n\n"
+        f"*{coin}*\n"
+        f"Lost: -${amount:.2f}\n\n"
+        f"💰 Bankroll: ${bankroll:.2f}"
     )
 
 
