@@ -123,12 +123,12 @@ class AlliumSignal:
             return boost < -0.15
 
     def contradicts_side(self, side: str) -> bool:
-        """Check if Allium data actively contradicts the proposed trade side."""
+        """Check if Allium data even slightly contradicts the proposed trade side."""
         boost = self.confidence_boost
         if side == "up":
-            return boost < -0.30  # Strong DOWN signal
+            return boost < -0.10  # Any DOWN signal
         else:  # down
-            return boost > 0.30   # Strong UP signal
+            return boost > 0.10   # Any UP signal
 
     def summary(self) -> str:
         """Human-readable summary of the signal."""
