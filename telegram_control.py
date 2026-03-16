@@ -88,28 +88,91 @@ def send_typing(chat_id: str):
 
 # ── Tool implementations (what Claude can do) ──
 
-def tool_read_logs(lines: int = 30) -> str:
+def tool_read_logs(lines: int = 30, service: str = "polymarket-bot") -> str:
     """Read recent bot logs from journalctl."""
     try:
         result = subprocess.run(
-            ["sudo", "journalctl", "-u", "polymarket-bot", "--no-pager", "-n", str(lines)],
+            ["sudo", "journalctl", "-u", service, "--no-pager", "-n", str(lines)],
             capture_output=True, text=True, timeout=10
         )
-        return result.stdout or result.stderr or "No logs found"
+        raw = result.stdout or result.stderr or "No logs found"
+        # Clean up systemd prefix noise for readability
+        cleaned = []
+        for line in raw.strip().split("\n"):
+            # Remove the "Mar 16 00:32:24 ip-172-31-39-190 python[4934]: " prefix
+            if "python[" in line:
+                parts = line.split("]: ", 1)
+                cleaned.append(parts[1] if len(parts) > 1 else line)
+            elif "systemd[" in line:
+                if "Started" in line or "Stopped" in line:
+                    cleaned.append(line.split("]: ", 1)[-1])
+            else:
+                cleaned.append(line)
+        return "\n".join(cleaned)
     except Exception as e:
         return f"Error reading logs: {e}"
 
 
 def tool_bot_status() -> str:
-    """Get bot service status."""
+    """Get bot service status in human-readable format."""
+    lines = []
+
+    # Check both services
+    for service, label in [("polymarket-bot", "Weather Bot"), ("crypto-maker", "Crypto Maker")]:
+        try:
+            result = subprocess.run(
+                ["sudo", "systemctl", "is-active", service],
+                capture_output=True, text=True, timeout=5
+            )
+            is_active = result.stdout.strip() == "active"
+
+            if is_active:
+                # Get uptime
+                uptime_result = subprocess.run(
+                    ["sudo", "systemctl", "show", service, "--property=ActiveEnterTimestamp"],
+                    capture_output=True, text=True, timeout=5
+                )
+                timestamp = uptime_result.stdout.strip().split("=", 1)[-1] if uptime_result.stdout else "unknown"
+
+                # Get memory
+                mem_result = subprocess.run(
+                    ["sudo", "systemctl", "show", service, "--property=MemoryCurrent"],
+                    capture_output=True, text=True, timeout=5
+                )
+                mem_bytes = mem_result.stdout.strip().split("=", 1)[-1] if mem_result.stdout else "0"
+                try:
+                    mem_mb = int(mem_bytes) / (1024 * 1024)
+                    mem_str = f"{mem_mb:.0f}MB"
+                except (ValueError, TypeError):
+                    mem_str = "?"
+
+                lines.append(f"🟢 {label}: Running ({mem_str} RAM)")
+                lines.append(f"   Started: {timestamp}")
+            else:
+                lines.append(f"🔴 {label}: Stopped")
+        except Exception:
+            lines.append(f"⚪ {label}: Unknown")
+
+    # Get last few log lines for context
     try:
-        result = subprocess.run(
-            ["sudo", "systemctl", "status", "polymarket-bot", "--no-pager"],
-            capture_output=True, text=True, timeout=10
+        log_result = subprocess.run(
+            ["sudo", "journalctl", "-u", "polymarket-bot", "--no-pager", "-n", "5"],
+            capture_output=True, text=True, timeout=5
         )
-        return result.stdout or result.stderr
-    except Exception as e:
-        return f"Error: {e}"
+        last_lines = log_result.stdout.strip().split("\n")
+        # Find the bankroll/P&L line
+        for line in reversed(last_lines):
+            if "Bankroll:" in line and "P&L:" in line:
+                # Extract the status part
+                parts = line.split("Bankroll:", 1)[-1].strip()
+                lines.append(f"\n💰 Bankroll: {parts.split('|')[0].strip()}")
+                for p in parts.split("|")[1:]:
+                    lines.append(f"   {p.strip()}")
+                break
+    except Exception:
+        pass
+
+    return "\n".join(lines) if lines else "Could not get status"
 
 
 def tool_restart_bot() -> str:
@@ -117,7 +180,7 @@ def tool_restart_bot() -> str:
     try:
         subprocess.run(["sudo", "systemctl", "restart", "polymarket-bot"], timeout=10)
         time.sleep(2)
-        return tool_bot_status()
+        return "✅ Weather bot restarted!\n\n" + tool_bot_status()
     except Exception as e:
         return f"Error restarting: {e}"
 
@@ -126,7 +189,7 @@ def tool_pause_bot() -> str:
     """Stop the trading bot service."""
     try:
         subprocess.run(["sudo", "systemctl", "stop", "polymarket-bot"], timeout=10)
-        return "Bot stopped. Use /resume to restart."
+        return "⏸️ Weather bot paused. Send /resume to start again."
     except Exception as e:
         return f"Error stopping: {e}"
 
