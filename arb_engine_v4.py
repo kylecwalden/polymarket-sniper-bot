@@ -558,41 +558,51 @@ class OrderManager:
 
     def execute_fok_order(self, client, score: BracketScore, bankroll: Bankroll,
                           event_slug: str = "", market_type: str = "") -> bool:
-        """Execute a Fill-or-Kill order (for weather markets — take liquidity, don't provide it).
+        """Execute a weather order — tries GTC (with auto-cancel) for reliable fills.
 
-        Weather forecasts update frequently, so passive limit orders get picked off.
-        FOK orders either fill instantly at the ask or get rejected — no stale exposure.
-
-        v5.0 fix: Fetch REAL orderbook ask price instead of using Gamma midpoint.
-        The midpoint often doesn't match any resting ask, causing FOK to fail.
+        v5.1 fix: FOK kept failing because prices must be rounded to tick size
+        and size must not exceed available liquidity. Switched to GTC with 20s
+        auto-cancel: post a limit buy at the best ask, wait up to 20 seconds for
+        fill, then cancel if unfilled. This is more reliable than FOK while still
+        avoiding stale exposure.
         """
+        import time as _time
         from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY
 
         model_prob = score.model_prob_yes if score.best_side == "yes" else (1 - score.model_prob_yes)
 
         # ── Fetch REAL best ask from orderbook ──
-        # The Gamma API "price" is a midpoint estimate; the CLOB orderbook has real resting orders.
-        # FOK must match an actual ask price to fill.
         ask_price = score.buy_price  # Fallback to Gamma midpoint
+        available_size = 999
         try:
             book = client.get_order_book(score.token_id)
             asks = book.get("asks", []) if isinstance(book, dict) else getattr(book, "asks", [])
             if asks:
+                # Parse all asks
+                parsed_asks = []
+                for a in asks:
+                    if isinstance(a, dict):
+                        p = float(a.get("price", 0))
+                        s = float(a.get("size", 0))
+                    else:
+                        p = float(a.price)
+                        s = float(a.size)
+                    parsed_asks.append((p, s))
+
                 # Best (lowest) ask price
-                best_ask = min(float(a.get("price", a.price) if isinstance(a, dict) else a.price) for a in asks)
+                best_ask = min(p for p, s in parsed_asks)
                 if 0.01 < best_ask < 0.99:
                     ask_price = best_ask
-                    # Also check available size at this level
-                    ask_size = sum(
-                        float(a.get("size", a.size) if isinstance(a, dict) else a.size)
-                        for a in asks
-                        if float(a.get("price", a.price) if isinstance(a, dict) else a.price) == best_ask
-                    )
-                    if ask_size < 5:
-                        console.print(f"[dim][v4] Thin book ({ask_size:.0f} shares at ${best_ask:.3f}): {score.question[:30]}[/dim]")
+                    # Available size at best ask level
+                    available_size = sum(s for p, s in parsed_asks if p == best_ask)
+                    if available_size < 5:
+                        console.print(f"[dim][v4] Thin book ({available_size:.0f} shares at ${best_ask:.3f}): {score.question[:30]}[/dim]")
         except Exception as e:
             console.print(f"[dim][v4] Orderbook fetch failed, using midpoint: {e}[/dim]")
+
+        # Round price to 2 decimal places (Polymarket tick size requirement)
+        ask_price = round(ask_price, 2)
 
         if ask_price <= 0.01 or ask_price >= 0.99:
             return False
@@ -600,18 +610,24 @@ class OrderManager:
         # Verify edge at REAL ask price
         edge_at_ask = model_prob - ask_price - POLYMARKET_FEE
         if edge_at_ask < V4_MIN_EDGE_WEATHER:
+            console.print(f"[dim][v4] Edge too low at real ask ${ask_price:.2f}: {edge_at_ask:.1%}[/dim]")
             return False
 
-        # Kelly sizing
+        # Kelly sizing — cap to available liquidity
         bet_amt = kelly_bet_size(edge_at_ask, ask_price, bankroll.balance, win_prob=model_prob)
         size = max(5, math.floor((bet_amt / ask_price) * 100) / 100)
-        actual_cost = ask_price * size
+        # Don't try to buy more shares than are available
+        if size > available_size and available_size >= 5:
+            size = math.floor(available_size * 100) / 100
+        actual_cost = round(ask_price * size, 2)
 
         if actual_cost > bankroll.balance:
             size = math.floor((bankroll.balance / ask_price) * 100) / 100
             if size < 5:
                 return False
-            actual_cost = ask_price * size
+            actual_cost = round(ask_price * size, 2)
+
+        console.print(f"[dim][v4] Posting GTC buy: {score.question[:40]} {score.best_side.upper()} | ${ask_price:.2f} x {size:.0f} shares (${actual_cost:.2f})[/dim]")
 
         try:
             order_args = OrderArgs(
@@ -621,21 +637,56 @@ class OrderManager:
                 side=BUY,
             )
             signed_order = client.create_order(order_args)
-            response = client.post_order(signed_order, OrderType.FOK)
+            response = client.post_order(signed_order, OrderType.GTC)
 
             order_id = ""
             if isinstance(response, dict):
                 order_id = response.get("orderID", response.get("id", ""))
                 success = response.get("success", True)
+                if not success:
+                    error_msg = response.get("errorMsg", response.get("error", str(response)))
+                    console.print(f"[red][v4] Order rejected: {error_msg}[/red]")
+                    return False
             else:
                 order_id = str(response)
-                success = True
 
-            if not success:
-                console.print(f"[dim][v4] FOK not filled @ ${ask_price:.3f}: {score.question[:40]}[/dim]")
+            if not order_id:
+                console.print(f"[dim][v4] No order ID returned: {response}[/dim]")
                 return False
 
-            # Record in bankroll
+            # ── Wait up to 20 seconds for fill, then cancel ──
+            filled = False
+            for wait_round in range(4):  # 4 x 5 seconds = 20 seconds
+                _time.sleep(5)
+                try:
+                    order_status = client.get_order(order_id)
+                    if isinstance(order_status, dict):
+                        status = order_status.get("status", "").upper()
+                        size_matched = float(order_status.get("size_matched", 0))
+                    else:
+                        status = getattr(order_status, "status", "").upper()
+                        size_matched = float(getattr(order_status, "size_matched", 0))
+
+                    if status == "MATCHED" or size_matched > 0:
+                        filled = True
+                        size = size_matched if size_matched > 0 else size
+                        actual_cost = round(ask_price * size, 2)
+                        break
+                    elif status in ("CANCELLED", "EXPIRED"):
+                        break
+                except Exception:
+                    pass  # Order status check failed, keep waiting
+
+            # Cancel if not filled after 20 seconds
+            if not filled:
+                try:
+                    client.cancel(order_id)
+                    console.print(f"[dim][v4] GTC not filled in 20s, cancelled: {score.question[:40]}[/dim]")
+                except Exception:
+                    pass
+                return False
+
+            # ── Filled! Record in bankroll ──
             bankroll.place_bet(
                 amount=actual_cost,
                 score=score,
@@ -646,15 +697,25 @@ class OrderManager:
             )
 
             msg = (
-                f"⚡ FOK FILLED: {score.question[:50]} {score.best_side.upper()} "
-                f"@ ${ask_price:.3f} | {size:.1f} shares | ${actual_cost:.2f} USDC"
+                f"⚡ FILLED: {score.question[:50]} {score.best_side.upper()} "
+                f"@ ${ask_price:.2f} | {size:.0f} shares | ${actual_cost:.2f} USDC"
             )
             console.print(f"[bold green][v4] {msg}[/bold green]")
             log_trade(msg)
             return True
 
         except Exception as e:
-            console.print(f"[dim][v4] FOK order failed: {e}[/dim]")
+            # Log the FULL error details
+            error_detail = str(e)
+            if hasattr(e, 'status_code'):
+                error_detail = f"status={e.status_code} msg={e.error_msg}"
+            elif hasattr(e, 'response'):
+                try:
+                    error_detail = f"status={e.response.status_code} body={e.response.text[:200]}"
+                except Exception:
+                    pass
+            console.print(f"[red][v4] Order failed: {error_detail}[/red]")
+            log_trade(f"ORDER ERROR: {score.question[:40]} | {error_detail}")
             return False
 
     def _cancel_all_safe(self, client):
