@@ -1,29 +1,137 @@
 # Polymarket Sniper Bot
 
-Automated trading bot for Polymarket prediction markets. Three strategies, one codebase:
+Automated trading bot for Polymarket prediction markets. Three strategies, one codebase. Run it locally in 5 minutes, or go full autopilot with cloud deployment and AI-powered remote control.
 
-1. **Weather Bracket Bot (v5)** — Trades daily weather temperature brackets using the GFS 31-member ensemble forecast. Counts how many ensemble members land in each bracket to compute probability. 8% edge threshold. FOK orders with real orderbook pricing.
-2. **Crypto Maker Bot (v5)** — Trades 15-min BTC/ETH up/down markets using a maker strategy. Posts GTC limit orders at $0.88-0.95 on the likely winning side ~10 seconds before window close. Zero taker fees + maker rebates.
-3. **Sniper (v1)** — Buys outcomes priced under 3 cents. High volume, low cost, lottery-ticket math.
+**Start simple. Add complexity when you're ready.**
 
-## Quick Start
+| Level | What You Get | Time to Set Up |
+|-------|-------------|----------------|
+| **Basic** | Bot runs on your laptop, you watch the terminal | 5 minutes |
+| **+ Telegram Alerts** | Get trade notifications on your phone | +2 minutes |
+| **+ Cloud Deployment** | Bot runs 24/7 even when your laptop is closed | +20 minutes |
+| **+ AI Control Bot** | Message your bot from your phone, Claude AI diagnoses issues and makes fixes | +5 minutes |
+
+## The Three Strategies
+
+1. **Weather Bracket Bot** — Trades daily weather temperature brackets using the GFS 31-member ensemble forecast. Counts how many ensemble members land in each bracket to compute probability. Buys when edge > 8%.
+2. **Crypto Maker Bot** — Trades 15-min BTC/ETH/SOL up/down markets. Posts GTC limit orders at $0.88-0.95 on the likely winning side ~10 seconds before window close. Zero taker fees + maker rebates.
+3. **Sniper** — Buys outcomes priced under 3 cents. High volume, low cost, lottery-ticket math.
+
+---
+
+# Level 1: Run Locally (5 minutes)
+
+Everything you need to get trading. No cloud, no Telegram, no API keys beyond Polymarket.
+
+### Step 1: Clone and install
 
 ```bash
 git clone https://github.com/kylecwalden/polymarket-sniper-bot.git
 cd polymarket-sniper-bot
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env with your credentials (see Setup below)
-
-# Connect VPN to non-US server, then:
-python bot.py bracket     # Weather bot (GFS ensemble)
-python bot.py maker       # Crypto maker (15-min markets)
-python bot.py dual        # Both in parallel
-python bot.py scan        # Preview cheap outcomes
-python bot.py positions   # Check P&L
 ```
 
-## How It Works
+### Step 2: Get your Polymarket credentials
+
+1. Go to [polymarket.com](https://polymarket.com) and create an account (deposit at least $20 USDC)
+2. Click your profile icon (top right) > **Cash** > **...** (three dots) > **Export Private Key**
+3. Open `.env` in any editor and fill in:
+   ```
+   PRIVATE_KEY=your_private_key_here
+   WALLET_ADDRESS=your_wallet_address_here
+   SIGNATURE_TYPE=1    # 1 = email login, 0 = MetaMask/EOA wallet
+   ```
+
+### Step 3: Connect VPN and run
+
+Polymarket blocks US IPs. Connect [ProtonVPN](https://pr.tn/ref/WMF7NFH4) (or any VPN) to a non-US server, then:
+
+```bash
+# Pick your strategy:
+python bot.py bracket     # Weather bot (recommended to start)
+python bot.py maker       # Crypto maker (15-min BTC/ETH/SOL)
+python bot.py dual        # Both in parallel
+
+# Utilities:
+python bot.py scan        # Preview cheap outcomes without buying
+python bot.py positions   # Check your P&L
+```
+
+**That's it.** The bot scans Polymarket, finds edges, and places trades. You'll see everything in your terminal. Keep it running as long as you want — close it anytime with `Ctrl+C`.
+
+---
+
+# Level 2: Add Telegram Alerts (+2 minutes)
+
+Get notifications on your phone for every trade, win, loss, and status update. No more watching the terminal.
+
+1. Open Telegram, search for **@BotFather**, send `/newbot`, follow the prompts, copy the **bot token**
+2. Search for **@userinfobot**, send any message, copy your **chat ID**
+3. Add to `.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=your_bot_token
+   TELEGRAM_CHAT_ID=your_chat_id
+   ```
+4. Restart the bot. You'll now get messages like:
+
+   > 🎯 **NEW TRADE PLACED**
+   > *Dallas High Temp Above 75°F*
+   > Betting: YES @ $0.42/share
+   > Cost: $5.00 (11 shares)
+   > Edge: 12.3% over market
+   > If we win: +$6.38 profit
+
+---
+
+# Level 3: Deploy to the Cloud (+20 minutes)
+
+Run the bot 24/7 on a cloud server so it keeps trading when your laptop is closed, sleeping, or off.
+
+**Recommended:** [AWS Free Tier](https://aws.amazon.com/free/) — 12 months free on a t3.micro instance. Pick a European region (like Ireland) and you get a non-US IP automatically, so you don't even need a VPN.
+
+The setup is the same as Level 1 — just do it on a cloud server instead of your laptop:
+
+1. Spin up a Linux instance (Ubuntu 22.04) on AWS, DigitalOcean, Linode, etc.
+2. SSH in, clone the repo, install dependencies, create `.env`
+3. Run with `nohup python bot.py dual &` or set up a systemd service for auto-restart on crashes
+
+**Pro tip:** If you pick an EU region, set `PROTON_VPN_REQUIRED=false` in your `.env` — the server's IP is already non-US.
+
+---
+
+# Level 4: AI-Powered Remote Control (+5 minutes)
+
+This is the fun one. Add a Claude AI brain to your Telegram bot so you can control everything from your phone using natural language.
+
+**What it does:** You message your Telegram bot, Claude reads your code and logs, diagnoses issues, edits files, restarts services — all from your phone. It's like having a DevOps engineer on call 24/7.
+
+**Requires:** An [Anthropic API key](https://console.anthropic.com) (~$0.01-0.05 per message)
+
+1. Sign up at [console.anthropic.com](https://console.anthropic.com) and create an API key
+2. Add to `.env`:
+   ```
+   ANTHROPIC_API_KEY=your_anthropic_api_key
+   ```
+3. Run the control bot (in addition to your trading bot):
+   ```bash
+   python telegram_control.py
+   ```
+4. Message your Telegram bot:
+
+   | Message | What Happens |
+   |---------|-------------|
+   | `/status` | Bot health, bankroll, P&L at a glance |
+   | `/logs` | Recent activity from both bots |
+   | `/restart` | Restart the trading bots |
+   | `/pause` / `/resume` | Pause or resume trading |
+   | *"Why aren't any trades going through?"* | Claude reads logs and code, tells you what's wrong |
+   | *"Lower the edge threshold to 5%"* | Claude edits the config and restarts the bot |
+   | *"How much have we made today?"* | Claude checks P&L and gives you a summary |
+
+---
+
+## How the Strategies Work
 
 ### Weather Bracket Bot (`python bot.py bracket`)
 
@@ -35,7 +143,7 @@ Trades daily temperature bracket markets across 20+ global cities (Dallas, Seoul
 1. Fetches GFS 31-member ensemble from Open-Meteo (`ensemble-api.open-meteo.com`)
 2. Counts how many members land in each temperature bracket
 3. Compares ensemble probability vs Polymarket price
-4. When edge > 8%, places FOK order at the real orderbook best ask
+4. When edge > 8%, places GTC limit order at the real orderbook best ask (auto-cancels after 20s if unfilled)
 5. Falls back to NOAA/Open-Meteo single forecast + normal distribution if ensemble unavailable
 6. Skips single-degree brackets (too noisy for ensemble resolution)
 7. Skips cities past 4 PM local time (observation window closed)
@@ -44,12 +152,12 @@ Trades daily temperature bracket markets across 20+ global cities (Dallas, Seoul
 
 ### Crypto Maker Bot (`python bot.py maker`)
 
-Trades 15-minute BTC/ETH "Up or Down" markets using a maker (limit order) strategy.
+Trades 15-minute BTC/ETH/SOL "Up or Down" markets using a maker (limit order) strategy.
 
 **Why taker arbitrage is dead:** In Feb 2026, Polymarket introduced [dynamic taker fees up to 3.15%](https://www.financemagnates.com/cryptocurrency/polymarket-introduces-dynamic-fees-to-curb-latency-arbitrage-in-short-term-crypto-markets/) and removed the 500ms taker delay. The old strategy of FOK-ing the spread no longer works.
 
 **The new strategy:**
-1. Connects to Binance WebSocket for real-time BTC/ETH prices
+1. Connects to Binance WebSocket for real-time BTC/ETH/SOL prices
 2. Tracks price from the start of each 15-min window
 3. At T-10 seconds before window close: checks if price has moved >0.1% in one direction
 4. If direction is clear → posts GTC maker bid at $0.88-0.95 on the likely winning side
@@ -64,85 +172,13 @@ Scans all active Polymarket events for outcomes priced under 3 cents. Places sma
 
 **The math:** Buy 100 outcomes at $0.02 each = $200 total. If 1 wins = $500 payout.
 
-## Prerequisites
-
-- **Python 3.11+**
-- **Polymarket account** with USDC deposited (on Polygon network)
-- **ProtonVPN** (or any VPN) — Polymarket blocks US IPs for trading
-- **macOS or Linux** (untested on Windows)
-
-## Setup (5 minutes)
-
-### Step 1: Clone and install
-
-```bash
-git clone https://github.com/kylecwalden/polymarket-sniper-bot.git
-cd polymarket-sniper-bot
-pip install -r requirements.txt
-```
-
-### Step 2: Configure
-
-```bash
-cp .env.example .env
-```
-
-Open `.env` in any editor and fill in your credentials.
-
-### Step 3: Get your Polymarket private key
-
-1. Go to [polymarket.com](https://polymarket.com) and create an account (deposit at least $20 USDC)
-2. Click your profile icon (top right) > **Cash** > **...** (three dots) > **Export Private Key**
-3. Paste it as `PRIVATE_KEY` in your `.env`
-4. Your wallet address is shown on the same page — paste as `WALLET_ADDRESS`
-5. If you logged in with email, set `SIGNATURE_TYPE=1`. If using MetaMask/EOA wallet, set `SIGNATURE_TYPE=0`
-
-### Step 4: Set up Telegram alerts (optional but recommended)
-
-1. Open Telegram, search for **@BotFather**
-2. Send `/newbot`, follow the prompts, copy the **bot token**
-3. Search for **@userinfobot**, send any message, copy your **chat ID**
-4. Paste both into `.env`:
-   ```
-   TELEGRAM_BOT_TOKEN=your_bot_token
-   TELEGRAM_CHAT_ID=your_chat_id
-   ```
-
-### Step 5: Connect VPN and run
-
-```bash
-# Connect ProtonVPN to any non-US server first, then:
-
-# Weather bot only (GFS ensemble — recommended to start)
-python bot.py bracket
-
-# Crypto maker only (15-min BTC/ETH)
-python bot.py maker
-
-# Both strategies in parallel
-python bot.py dual
-
-# Preview mode — see cheap outcomes without buying
-python bot.py scan
-
-# Check your positions and P&L
-python bot.py positions
-```
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `python bot.py bracket` | Weather bracket bot (GFS ensemble, FOK orders) |
-| `python bot.py maker` | Crypto maker bot (15-min BTC/ETH, GTC orders) |
-| `python bot.py dual` | Run weather + crypto maker in parallel |
-| `python bot.py scan` | Preview cheap outcomes (no buying) |
-| `python bot.py run` | Legacy v1 sniper bot |
-| `python bot.py positions` | Show positions and P&L |
+---
 
 ## Configuration Reference
 
-### Core Settings
+All settings are in `.env`. Defaults work out of the box — only `PRIVATE_KEY` and `WALLET_ADDRESS` are required.
+
+### Core (Required)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -151,7 +187,7 @@ python bot.py positions
 | `SIGNATURE_TYPE` | `1` | `1` = email login, `0` = EOA wallet |
 | `PROTON_VPN_REQUIRED` | `true` | Require non-US IP before trading |
 
-### Weather Bot (v5)
+### Weather Bot
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -166,11 +202,11 @@ python bot.py positions
 | `V4_MAX_BUY_PRICE` | `0.50` | Max share price (cheap = better upside) |
 | `V4_MAX_WEATHER_PER_CYCLE` | `6` | Max weather bets per scan cycle |
 
-### Crypto Maker Bot (v5)
+### Crypto Maker Bot
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MAKER_COINS` | `BTC,ETH` | Coins to trade |
+| `MAKER_COINS` | `BTC,ETH,SOL` | Coins to trade (comma-separated) |
 | `MAKER_BET_SIZE` | `5.0` | Default bet per trade (USDC) |
 | `MAKER_MAX_BET` | `10.0` | Max bet per trade (USDC) |
 | `MAKER_DAILY_BANKROLL` | `50.0` | Daily budget (USDC) |
@@ -182,7 +218,7 @@ python bot.py positions
 | `MAKER_LOSS_STREAK_LIMIT` | `3` | Pause after 3 consecutive losses |
 | `MAKER_LOSS_COOLDOWN` | `3600` | Cooldown after loss streak (seconds) |
 
-### Sniper Bot (v1)
+### Sniper Bot
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -194,11 +230,24 @@ python bot.py positions
 
 ### Optional Services
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TELEGRAM_BOT_TOKEN` | empty | Telegram bot token for alerts |
-| `TELEGRAM_CHAT_ID` | empty | Your Telegram chat ID |
-| `ALLIUM_API_KEY` | empty | Allium on-chain data API key |
+| Variable | Level | Description |
+|----------|-------|-------------|
+| `TELEGRAM_BOT_TOKEN` | Level 2 | Telegram bot token for alerts |
+| `TELEGRAM_CHAT_ID` | Level 2 | Your Telegram chat ID |
+| `ANTHROPIC_API_KEY` | Level 4 | Anthropic API key (for AI control bot) |
+| `ALLIUM_API_KEY` | Optional | Allium on-chain data API key |
+
+## All Commands
+
+| Command | Description |
+|---------|-------------|
+| `python bot.py bracket` | Weather bracket bot (GFS ensemble) |
+| `python bot.py maker` | Crypto maker bot (15-min BTC/ETH/SOL) |
+| `python bot.py dual` | Run weather + crypto maker in parallel |
+| `python bot.py scan` | Preview cheap outcomes (no buying) |
+| `python bot.py run` | Legacy v1 sniper bot |
+| `python bot.py positions` | Show positions and P&L |
+| `python telegram_control.py` | AI-powered Telegram control bot (Level 4) |
 
 ## Project Structure
 
@@ -208,35 +257,32 @@ polymarket-sniper-bot/
 ├── .env.example            # Config template — copy to .env
 ├── requirements.txt        # Python dependencies
 │
-├── # ── Weather Bracket Bot (v5) ──
+├── # ── Weather Bracket Bot ──
 ├── arb_engine_v4.py        # Weather scoring + trading loop (GFS ensemble)
 ├── bracket_markets.py      # Discovers weather bracket events from Gamma API
 ├── bracket_model.py        # Probability models (ensemble counting + normal dist)
 ├── noaa_feed.py            # Weather data (GFS ensemble + NOAA + Open-Meteo)
 │
-├── # ── Crypto Maker Bot (v5) ──
+├── # ── Crypto Maker Bot ──
 ├── arb_engine_v5_maker.py  # 15-min crypto maker strategy
 ├── crypto_markets.py       # 15-min up/down market discovery
 ├── binance_feed.py         # Real-time BTC/ETH/SOL prices (WebSocket)
 │
+├── # ── Remote Control (Level 4) ──
+├── telegram_control.py     # Claude AI Telegram bot (control from phone)
+├── telegram_alerts.py      # Trade alerts via Telegram (Level 2)
+│
 ├── # ── Shared Infrastructure ──
 ├── trader.py               # CLOB order placement + tracking
 ├── tracker.py              # Position monitoring + P&L
-├── scanner.py              # Gamma API market scanner (v1)
+├── scanner.py              # Gamma API market scanner
 ├── vpn.py                  # VPN connection verification
-├── telegram_alerts.py      # Trade alerts via Telegram
 ├── allium_feed.py          # On-chain smart money signals
-│
-├── # ── Legacy ──
-├── arb_engine.py           # v3.5 latency arb engine (deprecated)
-├── analyzer.py             # Performance analysis
 │
 └── data/                   # Auto-created: orders, trades, logs
 ```
 
 ## Safety Features
-
-Both bots have multiple layers of protection:
 
 | Guard | Weather Bot | Crypto Maker |
 |-------|------------|--------------|
@@ -268,9 +314,11 @@ If this bot makes you money, consider tipping the developer:
 ## Helpful Links
 
 - [Sign up for Polymarket](https://polymarket.com)
-- [Get ProtonVPN](https://pr.tn/ref/WMF7NFH4) — Free VPN required for trading
+- [Get ProtonVPN](https://pr.tn/ref/WMF7NFH4) — Free VPN required for trading from the US
 - [Open-Meteo Ensemble API](https://open-meteo.com/en/docs/ensemble-api) — Free GFS ensemble data
 - [Allium Data Platform](https://app.allium.so) — On-chain intelligence (optional)
+- [Anthropic Console](https://console.anthropic.com) — API key for the AI control bot (Level 4)
+- [AWS Free Tier](https://aws.amazon.com/free/) — Run 24/7 in the cloud for free (Level 3)
 
 ## Disclaimer
 
