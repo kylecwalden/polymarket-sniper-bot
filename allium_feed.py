@@ -691,6 +691,221 @@ class AlliumFeed:
         return []
 
 
+    # ═══════════════════════════════════════════════
+    #  WEATHER MARKET QUERIES
+    # ═══════════════════════════════════════════════
+
+    def get_weather_signal(self, city: str, question: str) -> AlliumSignal:
+        """
+        Get Allium signal for a weather bracket market.
+
+        Checks what smart money wallets (70%+ win rate on weather) are betting
+        on the same city's temperature brackets today.
+
+        Args:
+            city: City name (e.g., "Chicago", "Dallas")
+            question: Full Polymarket question for cache keying
+
+        Returns:
+            AlliumSignal with smart money data for weather markets.
+        """
+        if not self._available:
+            if time.time() - self._last_error_ts < self._error_backoff:
+                return AlliumSignal(coin=city, window_ts=0, error="Allium unavailable")
+            self._available = True
+
+        if not ALLIUM_API_KEY:
+            return AlliumSignal(coin=city, window_ts=0, error="No API key")
+
+        # Check signal cache
+        cache_key = ("weather", city, question[:60])
+        if cache_key in self._signal_cache:
+            cached = self._signal_cache[cache_key]
+            if time.time() - cached.timestamp < SIGNAL_CACHE_TTL:
+                return cached
+
+        signal = AlliumSignal(coin=city, window_ts=0, timestamp=time.time())
+
+        # Query smart money activity on this city's weather markets
+        try:
+            side, vol, count = self._get_weather_smart_money(city, question)
+            signal.smart_money_side = side
+            signal.smart_money_volume = vol
+            signal.smart_money_count = count
+            signal.has_smart_data = True
+        except Exception as e:
+            signal.error = f"Weather smart$: {e}"
+
+        # Query flow imbalance on this specific question
+        try:
+            imbalance, yes_vol, no_vol, trade_count = self._get_weather_flow(question)
+            signal.flow_imbalance = imbalance
+            signal.flow_up_volume = yes_vol
+            signal.flow_down_volume = no_vol
+            signal.flow_total_trades = trade_count
+            signal.has_flow_data = True
+        except Exception as e:
+            err = f"Weather flow: {e}"
+            signal.error = f"{signal.error}; {err}" if signal.error else err
+
+        self._signal_cache[cache_key] = signal
+        return signal
+
+    def _get_weather_smart_money(self, city: str, question: str) -> tuple[Optional[str], float, int]:
+        """
+        Check what smart money wallets are betting on this city's weather markets.
+
+        Uses the weather-specific smart wallet list (cached separately).
+
+        Returns: (dominant_side, total_volume, wallet_count)
+        dominant_side is "up" (buying YES = temperature will be in this range)
+                     or "down" (buying NO)
+        """
+        smart_wallets = self._get_weather_smart_wallet_list()
+        if not smart_wallets:
+            return None, 0.0, 0
+
+        city_lower = city.lower()
+        wallet_list = ", ".join(f"'{w}'" for w in smart_wallets[:20])
+
+        sql = f"""
+        SELECT
+            token_outcome,
+            SUM(usd_collateral_amount) as volume,
+            COUNT(DISTINCT taker) as wallet_count
+        FROM polygon.predictions.trades_enriched
+        WHERE LOWER(question) LIKE '%temperature%{city_lower}%'
+          AND block_timestamp >= DATEADD(hour, -12, CURRENT_TIMESTAMP())
+          AND taker IN ({wallet_list})
+        GROUP BY token_outcome
+        """
+
+        rows = self._run_sql(sql, cache_ttl=FLOW_CACHE_TTL)
+
+        yes_vol = 0.0
+        no_vol = 0.0
+        yes_wallets = 0
+        no_wallets = 0
+
+        for row in rows:
+            outcome = str(row.get("token_outcome", row.get("TOKEN_OUTCOME", ""))).lower()
+            vol = float(row.get("volume", row.get("VOLUME", 0)) or 0)
+            wallets = int(row.get("wallet_count", row.get("WALLET_COUNT", 0)) or 0)
+
+            if outcome == "yes":
+                yes_vol += vol
+                yes_wallets += wallets
+            elif outcome == "no":
+                no_vol += vol
+                no_wallets += wallets
+
+        total_vol = yes_vol + no_vol
+        total_wallets = yes_wallets + no_wallets
+
+        if total_vol == 0:
+            return None, 0.0, 0
+
+        if yes_vol > no_vol * 1.5:
+            return "up", total_vol, total_wallets  # "up" = YES side
+        elif no_vol > yes_vol * 1.5:
+            return "down", total_vol, total_wallets  # "down" = NO side
+
+        return None, total_vol, total_wallets
+
+    def _get_weather_flow(self, question: str) -> tuple[float, float, float, int]:
+        """
+        Get volume flow on a specific weather question (last 12 hours).
+
+        Returns: (imbalance, yes_volume, no_volume, total_trades)
+        """
+        # Escape single quotes in question text for SQL
+        q_escaped = question.replace("'", "''")[:100]
+
+        sql = f"""
+        SELECT
+            token_outcome,
+            SUM(usd_collateral_amount) as total_volume,
+            COUNT(*) as trade_count
+        FROM polygon.predictions.trades_enriched
+        WHERE LOWER(question) LIKE '%{q_escaped.lower()[:60]}%'
+          AND block_timestamp >= DATEADD(hour, -12, CURRENT_TIMESTAMP())
+        GROUP BY token_outcome
+        """
+
+        rows = self._run_sql(sql, cache_ttl=FLOW_CACHE_TTL)
+
+        yes_vol = 0.0
+        no_vol = 0.0
+        total_trades = 0
+
+        for row in rows:
+            outcome = str(row.get("token_outcome", row.get("TOKEN_OUTCOME", ""))).lower()
+            vol = float(row.get("total_volume", row.get("TOTAL_VOLUME", 0)) or 0)
+            trades = int(row.get("trade_count", row.get("TRADE_COUNT", 0)) or 0)
+
+            if outcome == "yes":
+                yes_vol = vol
+            elif outcome == "no":
+                no_vol = vol
+            total_trades += trades
+
+        total = yes_vol + no_vol
+        if total == 0:
+            return 0.0, 0.0, 0.0, total_trades
+
+        imbalance = (yes_vol - no_vol) / total
+        return imbalance, yes_vol, no_vol, total_trades
+
+    def _get_weather_smart_wallet_list(self) -> list[str]:
+        """
+        Get list of smart money wallet addresses for weather markets.
+        Wallets with >70% win rate on temperature markets, last 7 days.
+        Cached for SMART_CACHE_TTL (1 hour).
+        """
+        cache_key = "weather_smart_wallets"
+        # Use a separate cache slot for weather wallets
+        if hasattr(self, '_weather_wallets_cache'):
+            cache_ts, cached_wallets = self._weather_wallets_cache
+            if cached_wallets and time.time() - cache_ts < SMART_CACHE_TTL:
+                return cached_wallets
+
+        sql = f"""
+        SELECT
+            taker as wallet_address,
+            COUNT(*) as total_trades,
+            SUM(CASE WHEN is_winning_outcome = true THEN 1 ELSE 0 END) as wins,
+            SUM(usd_collateral_amount) as total_volume
+        FROM polygon.predictions.trades_enriched
+        WHERE LOWER(question) LIKE '%temperature%'
+          AND block_timestamp >= DATEADD(day, -{SMART_MONEY_LOOKBACK_DAYS}, CURRENT_TIMESTAMP())
+        GROUP BY taker
+        HAVING COUNT(*) >= {SMART_MONEY_MIN_TRADES}
+          AND SUM(CASE WHEN is_winning_outcome = true THEN 1 ELSE 0 END)::FLOAT / NULLIF(COUNT(*), 0) >= {SMART_MONEY_MIN_WIN_RATE}
+          AND SUM(usd_collateral_amount) >= {SMART_MONEY_MIN_VOLUME}
+        ORDER BY total_volume DESC
+        LIMIT 50
+        """
+
+        try:
+            rows = self._run_sql(sql, cache_ttl=SMART_CACHE_TTL)
+        except Exception:
+            if hasattr(self, '_weather_wallets_cache'):
+                return self._weather_wallets_cache[1]
+            return []
+
+        wallets = []
+        for row in rows:
+            addr = row.get("wallet_address", row.get("WALLET_ADDRESS", ""))
+            if addr:
+                wallets.append(addr)
+
+        if wallets:
+            self._weather_wallets_cache = (time.time(), wallets)
+            print(f"[allium] Loaded {len(wallets)} weather smart money wallets")
+
+        return wallets
+
+
 # ═══════════════════════════════════════════════
 #  GLOBAL INSTANCE
 # ═══════════════════════════════════════════════

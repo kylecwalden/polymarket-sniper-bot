@@ -39,6 +39,7 @@ from noaa_feed import get_forecast, get_ensemble_forecast, CityForecast, is_obse
 from trader import init_client, PlacedOrder, save_order
 from vpn import ensure_vpn
 import telegram_alerts as tg
+from allium_feed import allium
 
 load_dotenv()
 console = Console()
@@ -818,6 +819,14 @@ async def run_bracket_bot():
     # Init CLOB client
     client = init_client(PRIVATE_KEY, SIGNATURE_TYPE, WALLET_ADDRESS)
 
+    # Test Allium smart money connection
+    allium_ok = allium.test_connection()
+    if allium_ok:
+        console.print("[green]  Allium: Connected (weather smart money active)[/green]")
+    else:
+        console.print("[yellow]  Allium: Unavailable (trading without smart money)[/yellow]")
+    console.print()
+
     # Init Bankroll
     bankroll = Bankroll(V4_DAILY_BANKROLL)
 
@@ -1008,7 +1017,31 @@ async def run_bracket_bot():
                     if event_traded >= V4_MAX_TRADES_PER_EVENT:
                         continue
 
-                    # ── Order routing: FOK for weather (take liquidity) ──
+                    # ── Allium smart money check ──
+                    # Extract city from question (e.g., "...temperature in Chicago...")
+                    city_name = ""
+                    q_lower = score.question.lower()
+                    if " in " in q_lower:
+                        after_in = score.question.split(" in ", 1)[1]
+                        city_name = after_in.split(" be ")[0].strip() if " be " in after_in else after_in.split(",")[0].strip()
+
+                    if city_name:
+                        allium_sig = allium.get_weather_signal(city_name, score.question)
+                        if allium_sig.has_smart_data or allium_sig.has_flow_data:
+                            console.print(f"    [cyan]🧠 {city_name} Allium: {allium_sig.summary()}[/cyan]")
+
+                            # Map our bet side to allium direction
+                            # best_side "yes" = betting YES on this bracket = "up" in allium terms
+                            allium_side = "up" if score.best_side == "yes" else "down"
+
+                            if allium_sig.contradicts_side(allium_side):
+                                console.print(f"    [yellow]🧠 Smart money CONTRADICTS {score.best_side.upper()} — SKIP[/yellow]")
+                                continue
+
+                            if allium_sig.confirms_side(allium_side):
+                                console.print(f"    [green]🧠 Smart money CONFIRMS {score.best_side.upper()}[/green]")
+
+                    # ── Order routing: GTC for weather (take liquidity) ──
                     filled = order_mgr.execute_fok_order(
                         client, score, bankroll,
                         event_slug=event.slug,
