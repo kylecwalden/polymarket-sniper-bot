@@ -52,6 +52,7 @@ from crypto_markets import (
 from trader import init_client, PlacedOrder, save_order
 from vpn import ensure_vpn
 import telegram_alerts as tg
+from allium_feed import allium
 
 load_dotenv()
 console = Console()
@@ -379,6 +380,14 @@ async def run_maker_bot():
         console.print(f"  {sym}: ${price:,.2f}")
     console.print()
 
+    # Test Allium smart money connection
+    allium_ok = allium.test_connection()
+    if allium_ok:
+        console.print("[green]  Allium: Connected (smart money signals active)[/green]")
+    else:
+        console.print("[yellow]  Allium: Unavailable (trading without smart money)[/yellow]")
+    console.print()
+
     # Start Binance WebSocket in background
     ws_task = asyncio.create_task(connect_binance())
 
@@ -500,6 +509,30 @@ async def run_maker_bot():
                         f"| ${window.start_price:,.2f} → ${current_price:,.2f}[/green]"
                     )
 
+                    # Check Allium smart money confirmation
+                    allium_signal = allium.get_signal(coin, current_window_start)
+                    allium_tag = ""
+                    if allium_signal.has_flow_data or allium_signal.has_smart_data:
+                        console.print(f"  [cyan]{coin} Allium: {allium_signal.summary()}[/cyan]")
+                        allium_tag = f" | Allium: {allium_signal.summary()}"
+
+                        if allium_signal.contradicts_side(direction):
+                            console.print(
+                                f"  [yellow]{coin}: Smart money CONTRADICTS "
+                                f"{direction.upper()} — SKIP[/yellow]"
+                            )
+                            window.order_placed = True
+                            continue
+
+                        if allium_signal.confirms_side(direction):
+                            console.print(
+                                f"  [green]{coin}: Smart money CONFIRMS "
+                                f"{direction.upper()} — boosting confidence[/green]"
+                            )
+                            confidence = min(confidence * 1.3, 0.6)
+                    else:
+                        console.print(f"  [dim]{coin} Allium: No data (trading on Binance alone)[/dim]")
+
                     # Calculate bid price based on confidence
                     bid_price = calculate_bid_price(confidence)
 
@@ -526,6 +559,8 @@ async def run_maker_bot():
                     window.order_placed = True
                     if order_info:
                         window.order_info = order_info
+                        if allium_tag:
+                            tg.send_message(f"🧠 Smart Money{allium_tag}")
                         bankroll.balance -= order_info["cost"]
                         bankroll.pending_orders.append(order_info)
 
