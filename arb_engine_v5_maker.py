@@ -1,35 +1,26 @@
 """
-Crypto Maker Strategy v5.0 — 15-min Market Maker
+Crypto Maker Strategy v5.5 — 15-min Market Maker + Hedge + Hybrid
 
-The taker arbitrage strategy (v3.5) is dead — Polymarket's Feb 2026 dynamic fees
-(up to 3.15%) and removal of the 500ms delay killed it.
+Three strategy modes:
+- "directional": Bet on predicted direction (UP/DOWN) using Binance + Allium signals
+- "hedge": Buy BOTH sides when combined ask < $0.98 (guaranteed profit)
+- "hybrid" (default): Try hedge first, fall back to directional
 
-NEW STRATEGY: Post GTC maker limit orders on the likely winning side of 15-min
-BTC/ETH/SOL up/down markets, ~2 minutes before window close.
-
-Why it works:
-- ~85% of price direction is locked in by T-2 minutes
-- Polymarket odds don't fully reflect this (slow to update near close)
-- 2 minutes gives enough time for orders to fill (T-10s was too fast)
-- Zero taker fees + maker rebates on GTC orders
-- High win rate (target: 80%+) with small per-trade profit ($0.05-0.10/share)
+Why hedge works:
+- Each 15-min market has UP and DOWN tokens. One always resolves to $1.00.
+- If you buy UP at $0.49 and DOWN at $0.48 ($0.97 total), you profit $0.03 guaranteed.
+- Zero directional risk. The $313→$438K bot on Polymarket did exactly this.
+- Combined with maker rebates (zero fees + daily rebate pool), even small edges stack.
 
 Flow:
-1. Connect to Binance WebSocket for real-time BTC/ETH/SOL prices
-2. At each 15-min window, track price from window start
-3. At T-120 seconds (2 min) before close:
-   a. Check Binance price vs window open price
-   b. If coin clearly up (>0.1%): post maker bid for UP at $0.88-0.95
-   c. If coin clearly down (<-0.1%): post maker bid for DOWN at $0.88-0.95
-   d. If ambiguous: skip (don't bet on coin flips)
-4. At T-0: cancel unfilled orders
-5. Wait for resolution, collect $1.00/share on wins
-
-Risk:
-- Max 1 order per window per coin
-- $5-10 per trade
-- Stop after 3 consecutive losses (1h cooldown)
-- Daily loss limit: $25
+1. Connect to Binance WebSocket for real-time BTC/ETH prices
+2. At each 15-min window, discover market and fetch orderbooks
+3. HYBRID MODE:
+   a. Check if UP ask + DOWN ask < HEDGE_SUM_TARGET ($0.98)
+   b. If yes: buy both sides → guaranteed profit at resolution
+   c. If no: fall back to directional (Binance direction + Allium confirmation)
+4. At T-0: cancel unfilled orders, resolve wins/losses
+5. Track maker rebate estimates (1% of volume)
 """
 
 import asyncio
@@ -37,7 +28,8 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -67,7 +59,7 @@ VPN_REQUIRED = os.getenv("PROTON_VPN_REQUIRED", "true").lower() == "true"
 MAKER_COINS = os.getenv("MAKER_COINS", "BTC,ETH").split(",")  # SOL dropped — 53% win rate
 # Low-liquidity hours (UTC) — skip trading when reversals are common
 MAKER_QUIET_HOURS_START = int(os.getenv("MAKER_QUIET_HOURS_START", "0"))   # midnight UTC
-MAKER_QUIET_HOURS_END = int(os.getenv("MAKER_QUIET_HOURS_END", "7"))      # 7am UTC
+MAKER_QUIET_HOURS_END = int(os.getenv("MAKER_QUIET_HOURS_END", "0"))      # 0 = disabled
 MAKER_BET_SIZE = float(os.getenv("MAKER_BET_SIZE", "3.0"))        # $3 per trade
 MAKER_MAX_BET = float(os.getenv("MAKER_MAX_BET", "5.0"))          # $5 max
 MAKER_DAILY_BANKROLL = float(os.getenv("MAKER_DAILY_BANKROLL", "50.0"))
@@ -75,10 +67,14 @@ MAKER_DAILY_LOSS_LIMIT = float(os.getenv("MAKER_DAILY_LOSS_LIMIT", "25.0"))
 MAKER_MIN_MOVE_PCT = float(os.getenv("MAKER_MIN_MOVE_PCT", "0.10"))   # 0.1% min price move
 MAKER_BID_PRICE_LOW = float(os.getenv("MAKER_BID_PRICE_LOW", "0.88"))  # Bid range low
 MAKER_BID_PRICE_HIGH = float(os.getenv("MAKER_BID_PRICE_HIGH", "0.95"))  # Bid range high
-MAKER_ENTRY_SECONDS = int(os.getenv("MAKER_ENTRY_SECONDS", "120"))    # Enter at T-120s (2 min before close)
+MAKER_ENTRY_SECONDS = int(os.getenv("MAKER_ENTRY_SECONDS", "480"))    # Enter at T-480s (8 min)
 MAKER_LOSS_STREAK_LIMIT = int(os.getenv("MAKER_LOSS_STREAK_LIMIT", "3"))
 MAKER_LOSS_COOLDOWN = int(os.getenv("MAKER_LOSS_COOLDOWN", "3600"))    # 1 hour
-PAPER_TRADE = os.getenv("PAPER_TRADE", "false").lower() == "true"     # Simulate trades without real money
+PAPER_TRADE = os.getenv("PAPER_TRADE", "false").lower() == "true"
+
+# Strategy mode: directional / hedge / hybrid
+MAKER_STRATEGY = os.getenv("MAKER_STRATEGY", "hybrid")
+HEDGE_SUM_TARGET = float(os.getenv("HEDGE_SUM_TARGET", "0.98"))  # Max combined ask to hedge
 
 # Logging
 LOG_DIR = Path("data")
@@ -116,7 +112,14 @@ class MakerBankroll:
     loss_streak: int = 0
     daily_losses: float = 0.0
     paused_until: float = 0.0
-    pending_orders: list = None  # list of dicts
+    pending_orders: list = None
+    # Hedge tracking
+    hedge_wins: int = 0
+    hedge_count: int = 0
+    hedge_pnl: float = 0.0
+    # Rebate tracking
+    estimated_rebates: float = 0.0
+    total_volume: float = 0.0
 
     def __post_init__(self):
         self.balance = self.starting
@@ -149,12 +152,16 @@ class MakerBankroll:
         self.wins += 1
         self.balance += payout
         self.loss_streak = 0
+        self.total_volume += bet_amount
+        self.estimated_rebates += bet_amount * 0.01
         log_trade(f"WIN: +${payout - bet_amount:.2f} | Bankroll: ${self.balance:.2f}")
 
     def record_loss(self, bet_amount: float):
         self.losses += 1
         self.loss_streak += 1
         self.daily_losses += bet_amount
+        self.total_volume += bet_amount
+        self.estimated_rebates += bet_amount * 0.01
         if self.loss_streak >= MAKER_LOSS_STREAK_LIMIT:
             self.paused_until = time.time() + MAKER_LOSS_COOLDOWN
             console.print(f"[red]🚨 {self.loss_streak} consecutive losses — pausing {MAKER_LOSS_COOLDOWN // 60} min[/red]")
@@ -165,28 +172,43 @@ class MakerBankroll:
             )
         log_trade(f"LOSS: -${bet_amount:.2f} | Bankroll: ${self.balance:.2f} | Streak: {self.loss_streak}")
 
+    def record_hedge_result(self, total_cost: float, payout: float):
+        """Record hedge trade result. Does NOT affect loss streak."""
+        profit = payout - total_cost
+        self.hedge_count += 1
+        self.hedge_pnl += profit
+        self.total_volume += total_cost
+        self.estimated_rebates += total_cost * 0.01
+        if profit >= 0:
+            self.hedge_wins += 1
+            self.balance += payout
+            log_trade(f"HEDGE WIN: +${profit:.2f} | Bankroll: ${self.balance:.2f}")
+        else:
+            # Hedge loss (rare — only if one leg didn't fill)
+            self.balance += payout
+            self.daily_losses += abs(profit)
+            log_trade(f"HEDGE LOSS: -${abs(profit):.2f} | Bankroll: ${self.balance:.2f}")
+
     def status_line(self) -> str:
         pnl = self.pnl
         color = "green" if pnl >= 0 else "red"
-        return (
-            f"Bankroll: ${self.balance:.2f} | "
-            f"P&L: [{color}]${pnl:+.2f}[/{color}] | "
-            f"W/L: {self.wins}/{self.losses} ({self.win_rate:.0%}) | "
-            f"Pending: {len(self.pending_orders)}"
-        )
+        parts = [
+            f"Bankroll: ${self.balance:.2f}",
+            f"P&L: [{color}]${pnl:+.2f}[/{color}]",
+            f"W/L: {self.wins}/{self.losses} ({self.win_rate:.0%})",
+            f"Pending: {len(self.pending_orders)}",
+        ]
+        if self.hedge_count > 0:
+            parts.append(f"Hedges: {self.hedge_wins}/{self.hedge_count} (${self.hedge_pnl:+.2f})")
+        if self.estimated_rebates > 0:
+            parts.append(f"Rebates: ~${self.estimated_rebates:.2f}")
+        return " | ".join(parts)
 
 
 # --- Direction Detection ---
 
 def detect_direction(coin: str, window_start_price: float) -> tuple[str | None, float, float]:
-    """
-    Detect price direction at near end of 15-min window.
-
-    Returns: (direction, confidence_pct, current_price)
-        direction: "up", "down", or None (ambiguous)
-        confidence_pct: absolute % move
-        current_price: latest Binance price
-    """
+    """Detect price direction at near end of 15-min window."""
     current = feed.get_price(coin)
     if current is None or window_start_price <= 0:
         return None, 0.0, 0.0
@@ -194,26 +216,69 @@ def detect_direction(coin: str, window_start_price: float) -> tuple[str | None, 
     pct_move = (current - window_start_price) / window_start_price * 100
 
     if abs(pct_move) < MAKER_MIN_MOVE_PCT:
-        return None, abs(pct_move), current  # Too close to call
+        return None, abs(pct_move), current
 
     direction = "up" if pct_move > 0 else "down"
     return direction, abs(pct_move), current
 
 
 def calculate_bid_price(confidence_pct: float) -> float:
-    """
-    Calculate maker bid price based on confidence.
-
-    Higher price move = more confident = willing to pay more.
-    0.1% move → bid $0.88 (risky)
-    0.3% move → bid $0.92 (moderate)
-    0.5%+ move → bid $0.95 (high confidence)
-    """
-    # Linear interpolation: 0.1% → low, 0.5% → high
+    """Calculate maker bid price based on confidence (linear interpolation)."""
     t = min(1.0, max(0.0, (confidence_pct - MAKER_MIN_MOVE_PCT) / 0.4))
     bid = MAKER_BID_PRICE_LOW + t * (MAKER_BID_PRICE_HIGH - MAKER_BID_PRICE_LOW)
-    # Round to 2 decimal places (Polymarket precision)
     return round(bid, 2)
+
+
+# --- Orderbook Helpers ---
+
+def get_best_ask(client, token_id: str) -> tuple[float, float] | None:
+    """Get best (lowest) ask price and available size from CLOB orderbook."""
+    try:
+        book = client.get_order_book(token_id)
+        asks = book.get("asks", []) if isinstance(book, dict) else getattr(book, "asks", [])
+        if not asks:
+            return None
+        parsed = []
+        for a in asks:
+            if isinstance(a, dict):
+                p, s = float(a.get("price", 0)), float(a.get("size", 0))
+            else:
+                p, s = float(a.price), float(a.size)
+            if p > 0:
+                parsed.append((p, s))
+        if not parsed:
+            return None
+        best_price = min(p for p, s in parsed)
+        best_size = sum(s for p, s in parsed if p == best_price)
+        return (round(best_price, 2), best_size)
+    except Exception:
+        return None
+
+
+def check_hedge_opportunity(client, market: CryptoMarket) -> dict | None:
+    """Check if both sides can be bought for < HEDGE_SUM_TARGET (guaranteed profit)."""
+    up_ask = get_best_ask(client, market.up_token_id)
+    down_ask = get_best_ask(client, market.down_token_id)
+
+    if up_ask is None or down_ask is None:
+        return None
+
+    up_price, up_size = up_ask
+    down_price, down_size = down_ask
+    total_cost = up_price + down_price
+
+    if total_cost < HEDGE_SUM_TARGET and 0.01 < up_price < 0.99 and 0.01 < down_price < 0.99:
+        projected_profit = 1.00 - total_cost
+        return {
+            "up_ask_price": up_price,
+            "up_ask_size": up_size,
+            "down_ask_price": down_price,
+            "down_ask_size": down_size,
+            "total_cost": total_cost,
+            "projected_profit": projected_profit,
+        }
+
+    return None
 
 
 # --- Order Execution ---
@@ -229,7 +294,6 @@ async def place_maker_order(
     from py_clob_client.clob_types import OrderArgs, OrderType
     from py_clob_client.order_builder.constants import BUY
 
-    # Pick token based on direction
     if direction == "up":
         token_id = market.up_token_id
         side_label = "UP"
@@ -237,8 +301,15 @@ async def place_maker_order(
         token_id = market.down_token_id
         side_label = "DOWN"
 
+    # Ensure maker status: bid must be below best ask
+    best = get_best_ask(client, token_id)
+    if best and bid_price >= best[0]:
+        bid_price = round(best[0] - 0.01, 2)
+        if bid_price < 0.01:
+            return None
+
     size = bet_amount / bid_price
-    size = max(5, math.floor(size * 100) / 100)  # Min 5 shares, 2 decimal places
+    size = max(5, math.floor(size * 100) / 100)
     actual_cost = bid_price * size
 
     try:
@@ -292,6 +363,108 @@ async def place_maker_order(
         return None
 
 
+async def place_hedge_orders(
+    client,
+    market: CryptoMarket,
+    hedge_info: dict,
+    bet_amount: float,
+    bankroll: "MakerBankroll",
+    is_paper: bool = False,
+) -> bool:
+    """Place both UP and DOWN orders to lock in guaranteed profit."""
+    hedge_id = str(uuid.uuid4())[:8]
+
+    # Bid 1 cent below each ask to ensure maker status
+    up_bid = round(hedge_info["up_ask_price"] - 0.01, 2)
+    down_bid = round(hedge_info["down_ask_price"] - 0.01, 2)
+
+    if up_bid < 0.01 or down_bid < 0.01:
+        console.print(f"  [yellow]{market.coin}: Hedge bid too low — SKIP[/yellow]")
+        return False
+
+    up_size = max(5, math.floor((bet_amount / up_bid) * 100) / 100)
+    down_size = max(5, math.floor((bet_amount / down_bid) * 100) / 100)
+    up_cost = round(up_bid * up_size, 2)
+    down_cost = round(down_bid * down_size, 2)
+    total_cost = up_cost + down_cost
+
+    if total_cost > bankroll.balance:
+        console.print(f"  [yellow]{market.coin}: Not enough bankroll for hedge (${total_cost:.2f} > ${bankroll.balance:.2f})[/yellow]")
+        return False
+
+    ptag = "📝 PAPER " if is_paper else ""
+
+    if is_paper:
+        # Simulate both orders
+        up_order = {
+            "order_id": f"paper_hedge_up_{market.coin}_{int(time.time())}",
+            "token_id": market.up_token_id,
+            "coin": market.coin,
+            "direction": "up",
+            "bid_price": up_bid,
+            "size": up_size,
+            "cost": up_cost,
+            "placed_at": time.time(),
+            "paper": True,
+            "trade_type": "hedge",
+            "hedge_id": hedge_id,
+        }
+        down_order = {
+            "order_id": f"paper_hedge_down_{market.coin}_{int(time.time())}",
+            "token_id": market.down_token_id,
+            "coin": market.coin,
+            "direction": "down",
+            "bid_price": down_bid,
+            "size": down_size,
+            "cost": down_cost,
+            "placed_at": time.time(),
+            "paper": True,
+            "trade_type": "hedge",
+            "hedge_id": hedge_id,
+        }
+    else:
+        # Place real UP order
+        up_order_info = await place_maker_order(client, market, "up", up_bid, bet_amount)
+        if up_order_info is None:
+            console.print(f"  [red]{market.coin}: Hedge UP leg failed — aborting[/red]")
+            return False
+        up_order_info["trade_type"] = "hedge"
+        up_order_info["hedge_id"] = hedge_id
+        up_order = up_order_info
+
+        # Place real DOWN order
+        down_order_info = await place_maker_order(client, market, "down", down_bid, bet_amount)
+        if down_order_info is None:
+            # Cancel the UP order — don't leave one-sided exposure
+            console.print(f"  [red]{market.coin}: Hedge DOWN leg failed — cancelling UP[/red]")
+            await cancel_order(client, up_order["order_id"])
+            return False
+        down_order_info["trade_type"] = "hedge"
+        down_order_info["hedge_id"] = hedge_id
+        down_order = down_order_info
+
+    projected = 1.00 - (up_bid + down_bid)
+    msg = (
+        f"🔄 {ptag}HEDGE: {market.coin} UP ${up_bid:.2f} + DOWN ${down_bid:.2f} "
+        f"= ${up_bid + down_bid:.2f} → +${projected:.3f}/share profit"
+    )
+    console.print(f"  [bold green]{msg}[/bold green]")
+    log_trade(msg)
+    tg.send_message(
+        f"🔄 {ptag}HEDGE\n{market.coin}\n"
+        f"UP @ ${up_bid:.2f} ({up_size:.0f} shares)\n"
+        f"DOWN @ ${down_bid:.2f} ({down_size:.0f} shares)\n"
+        f"Total: ${total_cost:.2f}\n"
+        f"Projected profit: +${projected * min(up_size, down_size):.2f}"
+    )
+
+    bankroll.balance -= total_cost
+    bankroll.pending_orders.append(up_order)
+    bankroll.pending_orders.append(down_order)
+
+    return True
+
+
 async def cancel_order(client, order_id: str) -> bool:
     """Cancel a specific order. Returns True if cancelled."""
     try:
@@ -313,7 +486,7 @@ async def check_if_filled(client, order_id: str) -> bool:
         live_ids = {o.get("id", o.get("orderID", "")) for o in live_orders}
         return order_id not in live_ids
     except Exception:
-        return False  # Assume not filled if we can't check
+        return False
 
 
 # --- Window Tracking ---
@@ -322,11 +495,12 @@ async def check_if_filled(client, order_id: str) -> bool:
 class WindowState:
     """Track the state of a 15-min trading window for a coin."""
     coin: str
-    window_start_ts: int       # Unix timestamp of window start
-    window_end_ts: int         # Unix timestamp of window end
-    start_price: float         # Binance price at window start
+    window_start_ts: int
+    window_end_ts: int
+    start_price: float
     order_placed: bool = False
     order_info: dict = None
+    hedge_orders: list = None  # [up_order, down_order] for hedge trades
     filled: bool = False
 
     @property
@@ -339,8 +513,9 @@ class WindowState:
 
     @property
     def needs_resolution(self) -> bool:
-        """Window closed and has an unresolved order."""
-        return self.order_placed and self.order_info is not None and self.seconds_remaining <= 0
+        """Window closed and has unresolved order(s)."""
+        has_orders = self.order_info is not None or (self.hedge_orders is not None and len(self.hedge_orders) > 0)
+        return self.order_placed and has_orders and self.seconds_remaining <= 0
 
 
 # --- Main Loop ---
@@ -348,11 +523,14 @@ class WindowState:
 async def run_maker_bot():
     """Main crypto maker bot loop."""
     console.print("[bold magenta]" + "=" * 60 + "[/bold magenta]")
-    console.print("[bold magenta]  Polymarket Crypto Maker v5.0[/bold magenta]")
-    console.print("[bold magenta]  15-min Market Maker Strategy[/bold magenta]")
+    console.print("[bold magenta]  Polymarket Crypto Maker v5.5[/bold magenta]")
+    console.print("[bold magenta]  15-min Market Maker + Hedge + Hybrid[/bold magenta]")
     console.print("[bold magenta]" + "=" * 60 + "[/bold magenta]")
     console.print()
 
+    console.print(f"  Strategy:        {MAKER_STRATEGY.upper()}")
+    if MAKER_STRATEGY in ("hedge", "hybrid"):
+        console.print(f"  Hedge target:    ${HEDGE_SUM_TARGET:.2f} (buy both sides if sum < this)")
     console.print(f"  Coins:           {', '.join(MAKER_COINS)}")
     console.print(f"  Bet size:        ${MAKER_BET_SIZE:.0f}-${MAKER_MAX_BET:.0f}")
     console.print(f"  Daily bankroll:  ${MAKER_DAILY_BANKROLL:.0f}")
@@ -396,13 +574,11 @@ async def run_maker_bot():
 
     # Start Binance WebSocket in background
     ws_task = asyncio.create_task(connect_binance())
-
-    # Wait a moment for WebSocket to connect
     await asyncio.sleep(3)
 
     # Track windows per coin
     windows: dict[str, WindowState] = {}
-    prev_windows: dict[str, WindowState] = {}  # Previous windows awaiting resolution
+    prev_windows: dict[str, WindowState] = {}
 
     console.print("[green]Maker bot started. Monitoring 15-min windows...[/green]")
     console.print()
@@ -418,63 +594,19 @@ async def run_maker_bot():
                 current_window_start = get_current_window_timestamp()
                 current_window_end = current_window_start + WINDOW_SECONDS
 
-                # Check if we need a new window state
                 window = windows.get(coin)
 
-                # Resolve previous window before starting a new one
+                # ── Resolve previous window ──
                 prev = prev_windows.get(coin)
                 if prev and prev.needs_resolution:
-                    order = prev.order_info
-                    is_paper = order.get("paper", False)
-                    filled = True if is_paper else await check_if_filled(client, order["order_id"])
-                    if filled:
-                        fill_tag = "📝 PAPER " if is_paper else ""
-                        console.print(f"  [green]✅ {fill_tag}{coin} maker order FILLED![/green]")
-                        save_trade_record({
-                            "type": "maker_fill", "coin": coin,
-                            "direction": order["direction"], "bid_price": order["bid_price"],
-                            "size": order["size"], "cost": order["cost"],
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        })
-                        # Check resolution — did we win or lose?
-                        try:
-                            from tracker import get_current_price
-                            token_price = get_current_price(order["token_id"])
-                            if token_price is not None and token_price >= 0.90:
-                                payout = order["size"] * 1.0
-                                bankroll.record_win(order["cost"], payout)
-                                ptag = "📝 PAPER " if is_paper else ""
-                                console.print(f"  [bold green]🎯 {ptag}{coin} WIN! +${payout - order['cost']:.2f}[/bold green]")
-                                tg.send_message(f"🎯 {ptag}MAKER WIN\n{coin} {order['direction'].upper()}\n+${payout - order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}")
-                            elif token_price is not None and token_price <= 0.10:
-                                bankroll.record_loss(order["cost"])
-                                ptag = "📝 PAPER " if is_paper else ""
-                                console.print(f"  [red]❌ {ptag}{coin} LOSS: -${order['cost']:.2f}[/red]")
-                                tg.send_message(f"❌ {ptag}MAKER LOSS\n{coin} {order['direction'].upper()}\n-${order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}")
-                            else:
-                                # Not resolved yet — give the money back for now
-                                console.print(f"  [yellow]{coin}: Resolution unclear (price: {token_price}) — refunding[/yellow]")
-                                bankroll.balance += order["cost"]
-                        except Exception as e:
-                            console.print(f"  [yellow]{coin}: Resolution check failed ({e}) — refunding[/yellow]")
-                            bankroll.balance += order["cost"]
-                        bankroll.pending_orders = [o for o in bankroll.pending_orders if o.get("order_id") != order["order_id"]]
-                    else:
-                        # Not filled — cancel and refund
-                        if not is_paper:
-                            await cancel_order(client, order["order_id"])
-                        bankroll.balance += order["cost"]
-                        console.print(f"  [dim]{coin}: Order not filled — cancelled (refunded ${order['cost']:.2f})[/dim]")
-                        bankroll.pending_orders = [o for o in bankroll.pending_orders if o.get("order_id") != order["order_id"]]
-                    prev.order_info = None  # Mark resolved
+                    await _resolve_window(client, prev, coin, bankroll)
                     del prev_windows[coin]
 
+                # ── New window detection ──
                 if window is None or window.window_start_ts != current_window_start:
-                    # Save old window for resolution
-                    if window and window.order_info:
+                    if window and (window.order_info or window.hedge_orders):
                         prev_windows[coin] = window
 
-                    # New window — record start price
                     start_price = feed.get_price(coin) or 0
                     if start_price > 0:
                         feed.set_window_start(coin, start_price)
@@ -494,7 +626,7 @@ async def run_maker_bot():
                         f"{max(0, window.seconds_remaining)}s remaining ──[/bold]"
                     )
 
-                # ── Check if it's time to enter (T-10 seconds) ──
+                # ── Entry decision ──
                 secs_left = window.seconds_remaining
 
                 if (
@@ -503,18 +635,53 @@ async def run_maker_bot():
                     and window.start_price > 0
                     and bankroll.can_trade
                 ):
-                    # Skip low-liquidity hours (midnight-7am UTC)
+                    # Skip quiet hours
                     current_hour = datetime.now(timezone.utc).hour
-                    if MAKER_QUIET_HOURS_START <= current_hour < MAKER_QUIET_HOURS_END:
-                        if not window.order_placed:
-                            console.print(
-                                f"  [yellow]{coin}: Quiet hours ({MAKER_QUIET_HOURS_START}:00-"
-                                f"{MAKER_QUIET_HOURS_END}:00 UTC) — SKIP[/yellow]"
-                            )
-                            window.order_placed = True
+                    if MAKER_QUIET_HOURS_START < MAKER_QUIET_HOURS_END and MAKER_QUIET_HOURS_START <= current_hour < MAKER_QUIET_HOURS_END:
+                        console.print(
+                            f"  [yellow]{coin}: Quiet hours ({MAKER_QUIET_HOURS_START}:00-"
+                            f"{MAKER_QUIET_HOURS_END}:00 UTC) — SKIP[/yellow]"
+                        )
+                        window.order_placed = True
                         continue
 
-                    # Time to make our move!
+                    # Discover the market (needed for both hedge and directional)
+                    market = discover_market(coin)
+                    if market is None or not market.is_active:
+                        console.print(f"  [yellow]{coin}: No active 15-min market found[/yellow]")
+                        window.order_placed = True
+                        continue
+
+                    # ── HEDGE CHECK (hybrid or hedge mode) ──
+                    if MAKER_STRATEGY in ("hedge", "hybrid"):
+                        hedge = check_hedge_opportunity(client, market)
+                        if hedge:
+                            console.print(
+                                f"  [bold green]{coin}: 🔄 HEDGE OPPORTUNITY! "
+                                f"UP ${hedge['up_ask_price']:.2f} + DOWN ${hedge['down_ask_price']:.2f} "
+                                f"= ${hedge['total_cost']:.2f} (profit: +${hedge['projected_profit']:.3f}/share)[/bold green]"
+                            )
+                            success = await place_hedge_orders(
+                                client, market, hedge, MAKER_BET_SIZE, bankroll,
+                                is_paper=PAPER_TRADE
+                            )
+                            window.order_placed = True
+                            if success:
+                                # Store both orders on the window for resolution
+                                hedge_orders = [
+                                    o for o in bankroll.pending_orders
+                                    if o.get("trade_type") == "hedge" and o.get("coin") == coin
+                                ][-2:]  # Last 2 added
+                                window.hedge_orders = hedge_orders
+                            continue
+                        else:
+                            if MAKER_STRATEGY == "hedge":
+                                console.print(f"  [dim]{coin}: No hedge (sum ≥ ${HEDGE_SUM_TARGET:.2f}) — SKIP[/dim]")
+                                window.order_placed = True
+                                continue
+                            # hybrid: fall through to directional
+
+                    # ── DIRECTIONAL (directional mode or hybrid fallback) ──
                     direction, confidence, current_price = detect_direction(
                         coin, window.start_price
                     )
@@ -523,7 +690,7 @@ async def run_maker_bot():
                         console.print(
                             f"  [yellow]{coin}: Ambiguous ({confidence:.3f}% move) — SKIP[/yellow]"
                         )
-                        window.order_placed = True  # Don't retry this window
+                        window.order_placed = True
                         continue
 
                     console.print(
@@ -555,10 +722,8 @@ async def run_maker_bot():
                     else:
                         console.print(f"  [dim]{coin} Allium: No data (trading on Binance alone)[/dim]")
 
-                    # Calculate bid price based on confidence
                     bid_price = calculate_bid_price(confidence)
 
-                    # Scale bet size with confidence
                     if confidence >= 0.3:
                         bet_amount = MAKER_MAX_BET
                     elif confidence >= 0.2:
@@ -566,18 +731,10 @@ async def run_maker_bot():
                     else:
                         bet_amount = MAKER_BET_SIZE
 
-                    # Discover the market
-                    market = discover_market(coin)
-                    if market is None or not market.is_active:
-                        console.print(f"  [yellow]{coin}: No active 15-min market found[/yellow]")
-                        window.order_placed = True
-                        continue
-
                     if PAPER_TRADE:
-                        # Paper trade — simulate the order
                         paper_order = {
                             "order_id": f"paper_{coin}_{int(time.time())}",
-                            "token_id": market.up_token if direction == "up" else market.down_token,
+                            "token_id": market.up_token_id if direction == "up" else market.down_token_id,
                             "direction": direction,
                             "bid_price": bid_price,
                             "size": bet_amount / bid_price,
@@ -585,6 +742,7 @@ async def run_maker_bot():
                             "coin": coin,
                             "placed_at": time.time(),
                             "paper": True,
+                            "trade_type": "directional",
                         }
                         console.print(
                             f"  [bold yellow]📝 PAPER BID: {coin} {direction.upper()} "
@@ -601,13 +759,12 @@ async def run_maker_bot():
                         bankroll.balance -= paper_order["cost"]
                         bankroll.pending_orders.append(paper_order)
                     else:
-                        # Real trade — place the maker order
                         order_info = await place_maker_order(
                             client, market, direction, bid_price, bet_amount
                         )
-
                         window.order_placed = True
                         if order_info:
+                            order_info["trade_type"] = "directional"
                             window.order_info = order_info
                             if allium_tag:
                                 tg.send_message(f"🧠 Smart Money{allium_tag}")
@@ -616,18 +773,17 @@ async def run_maker_bot():
 
 
             # ── Clean up stale pending orders (older than 20 minutes) ──
-            stale_cutoff = time.time() - 1200  # 20 minutes ago
+            stale_cutoff = time.time() - 1200
             stale_orders = [
                 o for o in bankroll.pending_orders
                 if o.get("placed_at", time.time()) < stale_cutoff
             ]
             for stale in stale_orders:
-                # Try to cancel on Polymarket (may already be gone)
-                try:
-                    await cancel_order(client, stale["order_id"])
-                except Exception:
-                    pass
-                # Refund the cost back to bankroll
+                if not stale.get("paper", False):
+                    try:
+                        await cancel_order(client, stale["order_id"])
+                    except Exception:
+                        pass
                 bankroll.balance += stale.get("cost", 0)
                 console.print(f"  [yellow]🧹 Cleaned up stale order: {stale.get('coin', '?')} — refunded ${stale.get('cost', 0):.2f}[/yellow]")
             if stale_orders:
@@ -640,20 +796,120 @@ async def run_maker_bot():
             if now % 60 == 0:
                 console.print(f"  {bankroll.status_line()}")
 
-            # Fast poll — check every second near window boundaries
             await asyncio.sleep(1)
 
     except KeyboardInterrupt:
-        # Cancel all open orders
         console.print("\n[yellow]Cancelling open orders...[/yellow]")
         for order in bankroll.pending_orders:
-            if order.get("order_id"):
+            if order.get("order_id") and not order.get("paper", False):
                 await cancel_order(client, order["order_id"])
         console.print("[yellow]Maker bot stopped.[/yellow]")
         console.print(f"\n  {bankroll.status_line()}")
 
     finally:
         ws_task.cancel()
+
+
+async def _resolve_window(client, prev: "WindowState", coin: str, bankroll: "MakerBankroll"):
+    """Resolve a closed window's orders (directional or hedge)."""
+    from tracker import get_current_price
+
+    if prev.hedge_orders and len(prev.hedge_orders) >= 2:
+        # ── Hedge resolution ──
+        up_order = prev.hedge_orders[0]
+        down_order = prev.hedge_orders[1]
+        is_paper = up_order.get("paper", False)
+
+        # Check fills
+        up_filled = True if is_paper else await check_if_filled(client, up_order["order_id"])
+        down_filled = True if is_paper else await check_if_filled(client, down_order["order_id"])
+
+        ptag = "📝 PAPER " if is_paper else ""
+
+        if up_filled and down_filled:
+            # Both filled — check which side won
+            total_cost = up_order["cost"] + down_order["cost"]
+            try:
+                up_price = get_current_price(up_order["token_id"])
+                down_price = get_current_price(down_order["token_id"])
+
+                if up_price is not None and up_price >= 0.90:
+                    # UP won — payout on UP shares
+                    payout = up_order["size"] * 1.0
+                    profit = payout - total_cost
+                    bankroll.record_hedge_result(total_cost, payout)
+                    console.print(f"  [bold green]🔄 {ptag}{coin} HEDGE WIN! UP won → +${profit:.2f}[/bold green]")
+                    tg.send_message(f"🔄 {ptag}HEDGE WIN\n{coin} UP won\n+${profit:.2f}\nBankroll: ${bankroll.balance:.2f}")
+                elif down_price is not None and down_price >= 0.90:
+                    # DOWN won — payout on DOWN shares
+                    payout = down_order["size"] * 1.0
+                    profit = payout - total_cost
+                    bankroll.record_hedge_result(total_cost, payout)
+                    console.print(f"  [bold green]🔄 {ptag}{coin} HEDGE WIN! DOWN won → +${profit:.2f}[/bold green]")
+                    tg.send_message(f"🔄 {ptag}HEDGE WIN\n{coin} DOWN won\n+${profit:.2f}\nBankroll: ${bankroll.balance:.2f}")
+                else:
+                    # Not resolved yet — refund
+                    console.print(f"  [yellow]{coin}: Hedge not resolved yet — refunding[/yellow]")
+                    bankroll.balance += total_cost
+            except Exception as e:
+                console.print(f"  [yellow]{coin}: Hedge resolution failed ({e}) — refunding[/yellow]")
+                bankroll.balance += total_cost
+        else:
+            # One or both not filled — cancel and refund
+            for order in [up_order, down_order]:
+                if not is_paper:
+                    await cancel_order(client, order["order_id"])
+                bankroll.balance += order["cost"]
+            console.print(f"  [dim]{coin}: Hedge not fully filled — cancelled (refunded)[/dim]")
+
+        # Clean up pending
+        hedge_ids = {up_order["order_id"], down_order["order_id"]}
+        bankroll.pending_orders = [o for o in bankroll.pending_orders if o.get("order_id") not in hedge_ids]
+        prev.hedge_orders = None
+
+    elif prev.order_info:
+        # ── Directional resolution (existing logic) ──
+        order = prev.order_info
+        is_paper = order.get("paper", False)
+        filled = True if is_paper else await check_if_filled(client, order["order_id"])
+
+        if filled:
+            fill_tag = "📝 PAPER " if is_paper else ""
+            console.print(f"  [green]✅ {fill_tag}{coin} maker order FILLED![/green]")
+            save_trade_record({
+                "type": "maker_fill", "coin": coin,
+                "direction": order["direction"], "bid_price": order["bid_price"],
+                "size": order["size"], "cost": order["cost"],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            try:
+                token_price = get_current_price(order["token_id"])
+                if token_price is not None and token_price >= 0.90:
+                    payout = order["size"] * 1.0
+                    bankroll.record_win(order["cost"], payout)
+                    ptag = "📝 PAPER " if is_paper else ""
+                    console.print(f"  [bold green]🎯 {ptag}{coin} WIN! +${payout - order['cost']:.2f}[/bold green]")
+                    tg.send_message(f"🎯 {ptag}MAKER WIN\n{coin} {order['direction'].upper()}\n+${payout - order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}")
+                elif token_price is not None and token_price <= 0.10:
+                    bankroll.record_loss(order["cost"])
+                    ptag = "📝 PAPER " if is_paper else ""
+                    console.print(f"  [red]❌ {ptag}{coin} LOSS: -${order['cost']:.2f}[/red]")
+                    tg.send_message(f"❌ {ptag}MAKER LOSS\n{coin} {order['direction'].upper()}\n-${order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}")
+                else:
+                    console.print(f"  [yellow]{coin}: Resolution unclear (price: {token_price}) — refunding[/yellow]")
+                    bankroll.balance += order["cost"]
+            except Exception as e:
+                console.print(f"  [yellow]{coin}: Resolution check failed ({e}) — refunding[/yellow]")
+                bankroll.balance += order["cost"]
+            bankroll.pending_orders = [o for o in bankroll.pending_orders if o.get("order_id") != order["order_id"]]
+        else:
+            if not is_paper:
+                await cancel_order(client, order["order_id"])
+            bankroll.balance += order["cost"]
+            console.print(f"  [dim]{coin}: Order not filled — cancelled (refunded ${order['cost']:.2f})[/dim]")
+            bankroll.pending_orders = [o for o in bankroll.pending_orders if o.get("order_id") != order["order_id"]]
+
+        prev.order_info = None
 
 
 def main():
