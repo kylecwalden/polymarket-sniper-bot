@@ -57,6 +57,10 @@ V6_MM_SIZE = float(os.getenv("V6_MM_SIZE", "5.0"))
 V6_MM_MAX_INVENTORY = float(os.getenv("V6_MM_MAX_INVENTORY", "20.0"))
 V6_MM_REQUOTE_THRESHOLD = float(os.getenv("V6_MM_REQUOTE_THRESHOLD", "0.02"))
 
+# Position limits — prevent over-exposure
+V6_MAX_TOTAL_DEPLOYED = float(os.getenv("V6_MAX_TOTAL_DEPLOYED", "300.0"))  # Hard cap across all positions
+V6_MAX_PER_COIN = float(os.getenv("V6_MAX_PER_COIN", "50.0"))              # Max deployed per coin
+
 # Late entry config
 V6_LATE_ENTRY_SECONDS = int(os.getenv("V6_LATE_ENTRY_SECONDS", "120"))
 V6_LATE_MIN_MOVE_PCT = float(os.getenv("V6_LATE_MIN_MOVE_PCT", "0.30"))
@@ -502,6 +506,19 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
         down_buy_price = round(1.0 - sell_price, 2)
         sell_size = max(5, math.floor((V6_MM_SIZE / down_buy_price) * 100) / 100)
 
+        # Position limit check — don't over-extend
+        order_cost = round(buy_price * buy_size + down_buy_price * sell_size, 2)
+        if not can_place_order(market.coin, order_cost):
+            total = get_total_deployed()
+            coin_total = get_coin_deployed(market.coin)
+            console.print(
+                f"  [yellow]📊 MM SKIP {market.coin}: Position limit "
+                f"(total: ${total:.0f}/${V6_MAX_TOTAL_DEPLOYED:.0f}, "
+                f"{market.coin}: ${coin_total:.0f}/${V6_MAX_PER_COIN:.0f})[/yellow]"
+            )
+            mm_state.last_midpoint = mid
+            return
+
         try:
             # Post buy side (UP token)
             buy_args = OrderArgs(token_id=market.up_token_id, price=buy_price, size=buy_size, side=BUY)
@@ -702,6 +719,146 @@ def _send_tg(msg: str):
         pass
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Position Limit Checks
+# ══════════════════════════════════════════════════════════════════════
+
+_position_cache = {"data": [], "last_fetch": 0}
+
+
+def _get_live_positions() -> list[dict]:
+    """Fetch current positions from Polymarket, cached for 10 seconds."""
+    import requests
+    now = time.time()
+    if now - _position_cache["last_fetch"] < 10:
+        return _position_cache["data"]
+    try:
+        wallet = os.getenv("WALLET_ADDRESS", "")
+        resp = requests.get(
+            f"https://data-api.polymarket.com/positions?user={wallet}",
+            timeout=10,
+        )
+        positions = resp.json()
+        _position_cache["data"] = positions
+        _position_cache["last_fetch"] = now
+        return positions
+    except Exception:
+        return _position_cache["data"]
+
+
+def get_total_deployed() -> float:
+    """Get total USDC deployed across all open positions."""
+    positions = _get_live_positions()
+    total = 0
+    for p in positions:
+        size = float(p.get("size", 0))
+        price = float(p.get("curPrice", 0) or 0)
+        if size > 0 and 0.05 < price < 0.95:  # Only count unresolved
+            total += size * min(price, 1 - price)
+    return total
+
+
+def get_coin_deployed(coin: str) -> float:
+    """Get USDC deployed for a specific coin."""
+    positions = _get_live_positions()
+    total = 0
+    for p in positions:
+        size = float(p.get("size", 0))
+        price = float(p.get("curPrice", 0) or 0)
+        title = (p.get("title", "") or "").lower()
+        coin_names = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "xrp"}
+        coin_name = coin_names.get(coin, coin.lower())
+        if size > 0 and coin_name in title and 0.05 < price < 0.95:
+            total += size * min(price, 1 - price)
+    return total
+
+
+def can_place_order(coin: str, order_cost: float) -> bool:
+    """Check if we can place an order without exceeding position limits."""
+    total = get_total_deployed()
+    coin_total = get_coin_deployed(coin)
+
+    if total + order_cost > V6_MAX_TOTAL_DEPLOYED:
+        return False
+    if coin_total + order_cost > V6_MAX_PER_COIN:
+        return False
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Auto-Claim: Sell resolved winning positions to recycle USDC
+# ══════════════════════════════════════════════════════════════════════
+
+async def auto_claim_resolved(client, bankroll: Bankroll):
+    """Sell resolved winning positions at $0.99 to free up USDC.
+
+    Polymarket has no redeem API — the workaround is to sell winners
+    at $0.99/share. Loses $0.01/share but instantly recycles cash.
+    """
+    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.order_builder.constants import SELL
+    import requests
+
+    try:
+        wallet = os.getenv("WALLET_ADDRESS", "")
+        resp = requests.get(
+            f"https://data-api.polymarket.com/positions?user={wallet}",
+            timeout=10,
+        )
+        positions = resp.json()
+
+        claimed_total = 0
+        for pos in positions:
+            size = float(pos.get("size", 0))
+            price = float(pos.get("curPrice", 0) or 0)
+            token_id = pos.get("tokenId", "") or pos.get("token_id", "")
+            title = pos.get("title", "")[:40]
+
+            if size < 1 or not token_id:
+                continue
+
+            # Only sell positions that have resolved (price at $0.95+)
+            if price >= 0.95:
+                sell_price = 0.99
+                sell_size = math.floor(size * 100) / 100
+
+                if sell_size < 1:
+                    continue
+
+                try:
+                    order_args = OrderArgs(
+                        token_id=token_id,
+                        price=sell_price,
+                        size=sell_size,
+                        side=SELL,
+                    )
+                    signed = client.create_order(order_args)
+                    resp = client.post_order(signed, OrderType.GTC)
+                    oid = _extract_order_id(resp)
+
+                    if oid:
+                        usdc_back = round(sell_price * sell_size, 2)
+                        claimed_total += usdc_back
+                        console.print(
+                            f"  [green]💰 AUTO-CLAIM: Sold {sell_size:.0f} shares of {title} "
+                            f"@ ${sell_price} → ${usdc_back:.2f} USDC freed[/green]"
+                        )
+                except Exception as e:
+                    console.print(f"  [dim]Auto-claim failed for {title}: {e}[/dim]")
+
+        if claimed_total > 0:
+            msg = f"💰 AUTO-CLAIMED: ${claimed_total:.2f} USDC recycled from resolved positions"
+            console.print(f"  [bold green]{msg}[/bold green]")
+            _send_tg(msg)
+            bankroll.mm_pool += claimed_total  # Add back to MM pool
+            return claimed_total
+
+    except Exception as e:
+        console.print(f"  [dim]Auto-claim check failed: {e}[/dim]")
+
+    return 0
+
+
 def log_trade(msg: str):
     """Log trade to file."""
     try:
@@ -735,6 +892,7 @@ async def run_v6_engine():
     console.print(f"  Markets:         {len(V6_COINS) * len(V6_TIMEFRAMES)}")
     console.print(f"  Bankroll:        ${V6_BANKROLL:.0f}")
     console.print(f"  Daily loss cap:  ${V6_DAILY_LOSS_LIMIT:.0f}")
+    console.print(f"  Max deployed:    ${V6_MAX_TOTAL_DEPLOYED:.0f} total, ${V6_MAX_PER_COIN:.0f}/coin")
     console.print(f"  Strategies:")
     if V6_HEDGE_ENABLED:
         console.print(f"    🔄 Hedge:    ON  (threshold: ${V6_HEDGE_THRESHOLD}, {V6_HEDGE_ALLOC*100:.0f}% bankroll)")
@@ -822,8 +980,16 @@ async def run_v6_engine():
                             resolve_late_entry(trade, bankroll, 0, PAPER_TRADE)
                         window.late_trades = []
 
-                    # Reset MM state for new window
-                    mm_states[market_key] = MMState(coin=coin)
+                    # DON'T reset MM state — persist inventory tracking across windows
+                    # Only reset the quote prices so it requotes at new midpoint
+                    if market_key in mm_states:
+                        mm_states[market_key].buy_price = 0
+                        mm_states[market_key].sell_price = 0
+                        mm_states[market_key].last_midpoint = 0
+                        mm_states[market_key].buy_order_id = None
+                        mm_states[market_key].sell_order_id = None
+                    else:
+                        mm_states[market_key] = MMState(coin=coin)
 
                     # New window
                     start_price = feed.get_price(coin) or 0
@@ -879,6 +1045,10 @@ async def run_v6_engine():
             if status_counter >= int(60 / V6_HEDGE_POLL_INTERVAL):
                 console.print(f"  {bankroll.status_line()}")
                 status_counter = 0
+
+            # ── Auto-claim every 60 seconds ──
+            if not PAPER_TRADE and now % 60 < 2:
+                await auto_claim_resolved(client, bankroll)
 
             # ── Telegram status every 5 minutes ──
             if now % 300 < 2:
