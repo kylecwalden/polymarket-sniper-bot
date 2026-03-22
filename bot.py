@@ -221,6 +221,12 @@ def cmd_v6():
     v6_main()
 
 
+def cmd_weather2():
+    """Run Weather V2 engine (ladder + forecast arb + whale copy)."""
+    from weather_engine_v2 import main as weather2_main
+    weather2_main()
+
+
 def cmd_positions():
     """Show current positions and P&L."""
     show_positions()
@@ -241,6 +247,7 @@ def main():
         "maker": cmd_maker,
         "dual": cmd_dual,
         "v6": cmd_v6,
+        "weather2": cmd_weather2,
     }
 
     if cmd in commands:
@@ -255,6 +262,7 @@ def main():
         console.print("  python bot.py maker       # Start v5 crypto maker (15-min markets)")
         console.print("  python bot.py dual        # Run weather + crypto maker in parallel")
         console.print("  python bot.py v6          # V6 multi-strategy (hedge + MM + late entry)")
+        console.print("  python bot.py weather2    # Weather V2 (ladder + forecast arb + whale copy)")
         console.print("  python bot.py positions   # Show positions and P&L")
 
 
