@@ -215,6 +215,12 @@ async def execute_ladder(client, opportunity, bankroll: Bankroll, is_paper: bool
     ladder_id = str(uuid.uuid4())[:8]
     ptag = "📝 " if is_paper else ""
 
+    # Skip if we already have a ladder on this city+date
+    res_date = str(brackets[0].resolution_time.date()) if hasattr(brackets[0], 'resolution_time') else ""
+    if _already_has_city_ladder(bankroll, city, res_date):
+        console.print(f"  [dim]{city}: Already have ladder for {res_date} — skip[/dim]")
+        return False
+
     filled_count = 0
     total_spent = 0
 
@@ -334,6 +340,11 @@ async def execute_forecast_arb(client, opp, bankroll: Bankroll, is_paper: bool):
 
     market = opp["market"]
     ptag = "📝 " if is_paper else ""
+
+    # Skip if already have position on this token
+    if _already_has_position(bankroll, market.yes_token_id):
+        return False
+
     price = round(market.yes_price, 2)
     size = max(5, math.floor((W2_FORECAST_BET_SIZE / price) * 100) / 100)
     cost = round(price * size, 2)
@@ -525,10 +536,20 @@ async def execute_whale_copy(client, opp, bankroll: Bankroll, is_paper: bool):
 # ══════════════════════════════════════════════════════════════════════
 
 def check_resolutions(bankroll: Bankroll, client, is_paper: bool):
-    """Check if any open positions have resolved."""
+    """Check if any open positions have resolved.
+
+    IMPORTANT: Weather markets resolve at END OF DAY when actual temp is recorded.
+    A bracket priced at $0.02 hasn't LOST — it just hasn't resolved yet.
+    Only check resolution when:
+    - Price jumps to $0.90+ (market resolved YES = WIN)
+    - Price drops to $0.01 AND the market's resolution date has PASSED (LOSS)
+    - Forecast arb: price rises to exit threshold (early profit-take)
+    """
     from tracker import get_current_price
+    from datetime import date as date_type
 
     ptag = "📝 " if is_paper else ""
+    today = str(date_type.today())
     resolved = []
 
     for pos in bankroll.open_positions:
@@ -537,7 +558,7 @@ def check_resolutions(bankroll: Bankroll, client, is_paper: bool):
             if price is None:
                 continue
 
-            # Check for exit on forecast arb (sell at 45¢)
+            # Check for early exit on forecast arb (sell at 45¢)
             if pos.strategy == "forecast" and price >= W2_FORECAST_EXIT_PRICE:
                 payout = round(pos.shares * price, 2)
                 profit = payout - pos.cost
@@ -551,7 +572,7 @@ def check_resolutions(bankroll: Bankroll, client, is_paper: bool):
                 resolved.append(pos)
                 continue
 
-            # Win: price near $1
+            # Win: price near $1 (market resolved in our favor)
             if price >= 0.90:
                 payout = round(pos.shares * 1.00, 2)
                 profit = payout - pos.cost
@@ -567,8 +588,8 @@ def check_resolutions(bankroll: Bankroll, client, is_paper: bool):
                 _send_tg(msg)
                 resolved.append(pos)
 
-            # Loss: price near $0
-            elif price <= 0.10:
+            # Loss: ONLY if resolution date has PASSED and price is near $0
+            elif price <= 0.05 and pos.resolution_date and pos.resolution_date < today:
                 bankroll.daily_losses += pos.cost
                 pnl = _get_strategy_pnl(bankroll, pos.strategy)
                 pnl.losses += 1
@@ -581,12 +602,16 @@ def check_resolutions(bankroll: Bankroll, client, is_paper: bool):
                 _send_tg(msg)
                 resolved.append(pos)
 
+            # Still pending — don't touch it
+            # A bracket at $0.02 that we bought at $0.02 is NOT a loss yet
+
         except Exception:
             continue
 
     # Remove resolved positions
     for pos in resolved:
-        bankroll.open_positions.remove(pos)
+        if pos in bankroll.open_positions:
+            bankroll.open_positions.remove(pos)
 
 
 def _get_strategy_pnl(bankroll: Bankroll, strategy: str) -> StrategyPnL:
@@ -612,6 +637,19 @@ def _send_tg(msg: str):
         tg.send_message(msg)
     except Exception:
         pass
+
+
+def _already_has_position(bankroll: Bankroll, token_id: str) -> bool:
+    """Check if we already have a position on this token."""
+    return any(p.token_id == token_id for p in bankroll.open_positions)
+
+
+def _already_has_city_ladder(bankroll: Bankroll, city: str, resolution_date: str) -> bool:
+    """Check if we already have a ladder on this city+date."""
+    return any(
+        p.strategy == "ladder" and p.city == city and p.resolution_date == resolution_date
+        for p in bankroll.open_positions
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
