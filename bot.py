@@ -215,6 +215,12 @@ def cmd_dual():
     asyncio.run(run_both())
 
 
+def cmd_v6():
+    """Run V6 multi-strategy engine (hedge + market making + late entry)."""
+    from arb_engine_v6 import main as v6_main
+    v6_main()
+
+
 def cmd_positions():
     """Show current positions and P&L."""
     show_positions()
@@ -234,6 +240,7 @@ def main():
         "bracket": cmd_bracket,
         "maker": cmd_maker,
         "dual": cmd_dual,
+        "v6": cmd_v6,
     }
 
     if cmd in commands:
@@ -247,6 +254,7 @@ def main():
         console.print("  python bot.py bracket     # Start v5 weather bot (GFS ensemble)")
         console.print("  python bot.py maker       # Start v5 crypto maker (15-min markets)")
         console.print("  python bot.py dual        # Run weather + crypto maker in parallel")
+        console.print("  python bot.py v6          # V6 multi-strategy (hedge + MM + late entry)")
         console.print("  python bot.py positions   # Show positions and P&L")
 
 
