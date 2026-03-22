@@ -30,7 +30,8 @@ console = Console()
 # Configuration
 # ══════════════════════════════════════════════════════════════════════
 
-V6_COINS = os.getenv("V6_COINS", "BTC,ETH").upper().split(",")
+V6_COINS = os.getenv("V6_COINS", "BTC,ETH,SOL,XRP").upper().split(",")
+V6_TIMEFRAMES = os.getenv("V6_TIMEFRAMES", "5m,15m").split(",")
 V6_BANKROLL = float(os.getenv("V6_BANKROLL", "100.0"))
 V6_DAILY_LOSS_LIMIT = float(os.getenv("V6_DAILY_LOSS_LIMIT", "40.0"))
 PAPER_TRADE = os.getenv("PAPER_TRADE", "false").lower() == "true"
@@ -330,24 +331,62 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
 
     # Check if midpoint moved enough to requote
     if mm_state.last_midpoint > 0 and abs(mid - mm_state.last_midpoint) < V6_MM_REQUOTE_THRESHOLD:
-        # No significant move — check if existing quotes filled
-        if is_paper and mm_state.buy_price > 0:
-            # Paper: simulate fills based on price movement
-            if mid <= mm_state.buy_price and not mm_state.buy_filled:
-                mm_state.buy_filled = True
-                mm_state.inventory_up += V6_MM_SIZE / mm_state.buy_price
-                console.print(f"  [cyan]📊 {ptag}MM BUY FILL: {market.coin} UP @ ${mm_state.buy_price:.2f}[/cyan]")
+        # Check if existing quotes have filled
+        if mm_state.buy_price > 0:
+            if is_paper:
+                # Paper: simulate fills based on price movement
+                if mid <= mm_state.buy_price and not mm_state.buy_filled:
+                    mm_state.buy_filled = True
+                    mm_state.inventory_up += V6_MM_SIZE / mm_state.buy_price
+                    console.print(f"  [cyan]📊 {ptag}MM BUY FILL: {market.coin} UP @ ${mm_state.buy_price:.2f}[/cyan]")
+                    _send_tg(f"📊 {ptag}MM BUY FILL: {market.coin} UP @ ${mm_state.buy_price:.2f}")
 
-            if mid >= mm_state.sell_price and not mm_state.sell_filled:
-                mm_state.sell_filled = True
-                mm_state.inventory_down += V6_MM_SIZE / (1.0 - mm_state.sell_price)
-                console.print(f"  [cyan]📊 {ptag}MM SELL FILL: {market.coin} UP @ ${mm_state.sell_price:.2f}[/cyan]")
+                if mid >= mm_state.sell_price and not mm_state.sell_filled:
+                    mm_state.sell_filled = True
+                    mm_state.inventory_down += V6_MM_SIZE / (1.0 - mm_state.sell_price)
+                    console.print(f"  [cyan]📊 {ptag}MM SELL FILL: {market.coin} UP @ ${mm_state.sell_price:.2f}[/cyan]")
+                    _send_tg(f"📊 {ptag}MM SELL FILL: {market.coin} UP @ ${mm_state.sell_price:.2f}")
+            else:
+                # Real: check order fill status via API
+                try:
+                    if mm_state.buy_order_id and not mm_state.buy_filled:
+                        order = client.get_order(mm_state.buy_order_id)
+                        if isinstance(order, dict):
+                            matched = float(order.get("size_matched", 0))
+                            status = order.get("status", "").upper()
+                        else:
+                            matched = float(getattr(order, "size_matched", 0))
+                            status = getattr(order, "status", "").upper()
+                        if matched > 0 or status == "MATCHED":
+                            mm_state.buy_filled = True
+                            mm_state.inventory_up += matched if matched > 0 else V6_MM_SIZE / mm_state.buy_price
+                            cost = round(mm_state.buy_price * (matched if matched > 0 else V6_MM_SIZE / mm_state.buy_price), 2)
+                            console.print(f"  [cyan]📊 MM BUY FILL: {market.coin} UP @ ${mm_state.buy_price:.2f} ({matched:.1f} shares)[/cyan]")
+                            _send_tg(f"📊 MM BUY FILL: {market.coin} UP @ ${mm_state.buy_price:.2f} ({matched:.1f} shares, ${cost:.2f})")
+
+                    if mm_state.sell_order_id and not mm_state.sell_filled:
+                        order = client.get_order(mm_state.sell_order_id)
+                        if isinstance(order, dict):
+                            matched = float(order.get("size_matched", 0))
+                            status = order.get("status", "").upper()
+                        else:
+                            matched = float(getattr(order, "size_matched", 0))
+                            status = getattr(order, "status", "").upper()
+                        if matched > 0 or status == "MATCHED":
+                            mm_state.sell_filled = True
+                            down_price = round(1.0 - mm_state.sell_price, 2)
+                            mm_state.inventory_down += matched if matched > 0 else V6_MM_SIZE / down_price
+                            cost = round(down_price * (matched if matched > 0 else V6_MM_SIZE / down_price), 2)
+                            console.print(f"  [cyan]📊 MM SELL FILL: {market.coin} DOWN @ ${down_price:.2f} ({matched:.1f} shares)[/cyan]")
+                            _send_tg(f"📊 MM SELL FILL: {market.coin} DOWN @ ${down_price:.2f} ({matched:.1f} shares, ${cost:.2f})")
+                except Exception as e:
+                    console.print(f"  [dim]MM fill check error: {e}[/dim]")
 
             # Round-trip complete?
             if mm_state.buy_filled and mm_state.sell_filled:
                 spread_profit = round(V6_MM_SPREAD * min(
-                    V6_MM_SIZE / mm_state.buy_price,
-                    V6_MM_SIZE / (1.0 - mm_state.sell_price)
+                    mm_state.inventory_up,
+                    mm_state.inventory_down,
                 ), 2)
                 bankroll.mm_pool += spread_profit
                 bankroll.mm_pnl.wins += 1
@@ -363,6 +402,8 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
                 # Reset for next quote
                 mm_state.buy_filled = False
                 mm_state.sell_filled = False
+                mm_state.buy_order_id = None
+                mm_state.sell_order_id = None
                 mm_state.buy_price = 0
                 mm_state.sell_price = 0
                 mm_state.inventory_up = 0
@@ -399,17 +440,62 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
         from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY
 
-        # Cancel existing
-        if mm_state.buy_order_id:
+        # Check fills on existing orders before cancelling
+        if mm_state.buy_order_id and not mm_state.buy_filled:
             try:
-                client.cancel(mm_state.buy_order_id)
+                order = client.get_order(mm_state.buy_order_id)
+                matched = float(order.get("size_matched", 0)) if isinstance(order, dict) else float(getattr(order, "size_matched", 0))
+                if matched > 0:
+                    mm_state.buy_filled = True
+                    mm_state.inventory_up += matched
+                    cost = round(mm_state.buy_price * matched, 2)
+                    console.print(f"  [cyan]📊 MM BUY FILL (pre-requote): {market.coin} UP @ ${mm_state.buy_price:.2f} ({matched:.1f} shares)[/cyan]")
+                    _send_tg(f"📊 MM BUY FILL: {market.coin} UP @ ${mm_state.buy_price:.2f} ({matched:.1f} shares, ${cost:.2f})")
+                else:
+                    client.cancel(mm_state.buy_order_id)
             except Exception:
-                pass
-        if mm_state.sell_order_id:
+                try:
+                    client.cancel(mm_state.buy_order_id)
+                except Exception:
+                    pass
+
+        if mm_state.sell_order_id and not mm_state.sell_filled:
             try:
-                client.cancel(mm_state.sell_order_id)
+                order = client.get_order(mm_state.sell_order_id)
+                matched = float(order.get("size_matched", 0)) if isinstance(order, dict) else float(getattr(order, "size_matched", 0))
+                if matched > 0:
+                    mm_state.sell_filled = True
+                    down_price = round(1.0 - mm_state.sell_price, 2)
+                    mm_state.inventory_down += matched
+                    cost = round(down_price * matched, 2)
+                    console.print(f"  [cyan]📊 MM SELL FILL (pre-requote): {market.coin} DOWN @ ${down_price:.2f} ({matched:.1f} shares)[/cyan]")
+                    _send_tg(f"📊 MM SELL FILL: {market.coin} DOWN @ ${down_price:.2f} ({matched:.1f} shares, ${cost:.2f})")
+                else:
+                    client.cancel(mm_state.sell_order_id)
             except Exception:
-                pass
+                try:
+                    client.cancel(mm_state.sell_order_id)
+                except Exception:
+                    pass
+
+        # Check for round-trip before posting new quotes
+        if mm_state.buy_filled and mm_state.sell_filled:
+            spread_profit = round(V6_MM_SPREAD * min(mm_state.inventory_up, mm_state.inventory_down), 2)
+            bankroll.mm_pool += spread_profit
+            bankroll.mm_pnl.wins += 1
+            bankroll.mm_pnl.total_pnl += spread_profit
+            bankroll.mm_pnl.trades += 1
+            bankroll.estimated_rebates += V6_MM_SIZE * 2 * 0.01
+            msg = f"📊 MM ROUND-TRIP: {market.coin} +${spread_profit:.2f} spread"
+            console.print(f"  [bold cyan]{msg}[/bold cyan]")
+            _send_tg(msg)
+            mm_state.buy_filled = False
+            mm_state.sell_filled = False
+            mm_state.inventory_up = 0
+            mm_state.inventory_down = 0
+
+        mm_state.buy_order_id = None
+        mm_state.sell_order_id = None
 
         buy_size = max(5, math.floor((V6_MM_SIZE / buy_price) * 100) / 100)
         # "Sell UP" = Buy DOWN at complementary price
@@ -437,7 +523,10 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
                 f"BUY ${buy_price:.2f} / SELL ${sell_price:.2f}[/cyan]"
             )
         except Exception as e:
-            console.print(f"  [red]MM quote failed: {e}[/red]")
+            import traceback
+            console.print(f"  [red]MM quote failed: {type(e).__name__}: {e}[/red]")
+            console.print(f"  [dim]  buy: token={market.up_token_id[:12]}... price=${buy_price:.2f} size={buy_size}[/dim]")
+            console.print(f"  [dim]  sell: token={market.down_token_id[:12]}... price=${down_buy_price:.2f} size={sell_size}[/dim]")
 
     mm_state.last_midpoint = mid
 
@@ -630,7 +719,8 @@ async def run_v6_engine():
     """Run the V6 multi-strategy engine."""
     from binance_feed import feed, connect_binance, get_initial_prices, SYMBOLS
     from crypto_markets import (
-        discover_market, WINDOW_SECONDS,
+        discover_market, discover_market_tf, WINDOW_SECONDS,
+        TIMEFRAME_SECONDS,
         get_current_window_timestamp,
     )
     from trader import init_client
@@ -641,6 +731,8 @@ async def run_v6_engine():
     console.print("  [bold]Polymarket V6 Multi-Strategy Engine[/bold]")
     console.print("=" * 60)
     console.print(f"  Coins:           {', '.join(V6_COINS)}")
+    console.print(f"  Timeframes:      {', '.join(V6_TIMEFRAMES)}")
+    console.print(f"  Markets:         {len(V6_COINS) * len(V6_TIMEFRAMES)}")
     console.print(f"  Bankroll:        ${V6_BANKROLL:.0f}")
     console.print(f"  Daily loss cap:  ${V6_DAILY_LOSS_LIMIT:.0f}")
     console.print(f"  Strategies:")
@@ -708,20 +800,21 @@ async def run_v6_engine():
                 continue
 
             for coin in V6_COINS:
-                if coin not in SYMBOLS:
-                    continue
+              for tf in V6_TIMEFRAMES:
+                market_key = f"{coin}_{tf}"
+                tf_secs = TIMEFRAME_SECONDS.get(tf, 900)
 
-                current_window_ts = get_current_window_timestamp()
-                current_window_end = current_window_ts + WINDOW_SECONDS
+                current_window_ts = (now // tf_secs) * tf_secs
+                current_window_end = current_window_ts + tf_secs
                 secs_left = current_window_end - now
 
                 # Discover market
-                market = discover_market(coin)
+                market = discover_market_tf(coin, tf)
                 if not market or not market.is_active:
                     continue
 
                 # ── Window management ──
-                window = windows.get(coin)
+                window = windows.get(market_key)
                 if window is None or window.window_start_ts != current_window_ts:
                     # Resolve previous window
                     if window and window.late_trades:
@@ -730,7 +823,7 @@ async def run_v6_engine():
                         window.late_trades = []
 
                     # Reset MM state for new window
-                    mm_states[coin] = MMState(coin=coin)
+                    mm_states[market_key] = MMState(coin=coin)
 
                     # New window
                     start_price = feed.get_price(coin) or 0
@@ -742,11 +835,11 @@ async def run_v6_engine():
                         window_start_ts=current_window_ts,
                         start_price=start_price,
                     )
-                    windows[coin] = window
+                    windows[market_key] = window
 
                     if start_price > 0:
                         console.print(
-                            f"── {coin} New window: "
+                            f"── {coin}/{tf} New window: "
                             f"{datetime.fromtimestamp(current_window_ts, tz=timezone.utc).strftime('%H:%M:%S')} UTC "
                             f"| Start: ${start_price:,.2f} | {secs_left}s remaining ──"
                         )
@@ -769,7 +862,9 @@ async def run_v6_engine():
 
                 # ── Priority 2: MARKET MAKING ──
                 if V6_MM_ENABLED and bankroll.mm_pool >= V6_MM_SIZE and secs_left > 60:
-                    await manage_mm_quotes(client, market, mm_states[coin], bankroll, PAPER_TRADE)
+                    if market_key not in mm_states:
+                        mm_states[market_key] = MMState(coin=coin)
+                    await manage_mm_quotes(client, market, mm_states[market_key], bankroll, PAPER_TRADE)
 
                 # ── Priority 3: LATE ENTRY ──
                 if (V6_LATE_ENABLED
@@ -784,6 +879,14 @@ async def run_v6_engine():
             if status_counter >= int(60 / V6_HEDGE_POLL_INTERVAL):
                 console.print(f"  {bankroll.status_line()}")
                 status_counter = 0
+
+            # ── Telegram status every 5 minutes ──
+            if now % 300 < 2:
+                _send_tg(
+                    f"📈 V6 Status\n"
+                    f"{bankroll.status_line()}\n"
+                    f"Markets: {len(V6_COINS)} coins × {len(V6_TIMEFRAMES)} timeframes"
+                )
 
             await asyncio.sleep(V6_HEDGE_POLL_INTERVAL)
 

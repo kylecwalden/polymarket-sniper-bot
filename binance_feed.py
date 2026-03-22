@@ -20,6 +20,7 @@ SYMBOLS = {
     "BTC": "btcusdt",
     "ETH": "ethusdt",
     "SOL": "solusdt",
+    "XRP": "xrpusdt",
 }
 
 

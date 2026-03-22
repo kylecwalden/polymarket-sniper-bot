@@ -11,14 +11,24 @@ import requests
 
 GAMMA_URL = "https://gamma-api.polymarket.com"
 
-# Supported coins and their slug prefixes
+# Supported coins and their slug prefixes (per timeframe)
 COIN_SLUGS = {
     "BTC": "btc-updown-15m",
     "ETH": "eth-updown-15m",
     "SOL": "sol-updown-15m",
 }
 
-WINDOW_SECONDS = 900  # 15 minutes
+# Multi-timeframe slug patterns
+COIN_SLUG_PATTERNS = {
+    "BTC": {"5m": "btc-updown-5m", "15m": "btc-updown-15m", "1h": "btc-updown-1h"},
+    "ETH": {"5m": "eth-updown-5m", "15m": "eth-updown-15m", "1h": "eth-updown-1h"},
+    "SOL": {"5m": "sol-updown-5m", "15m": "sol-updown-15m", "1h": "sol-updown-1h"},
+    "XRP": {"5m": "xrp-updown-5m", "15m": "xrp-updown-15m", "1h": "xrp-updown-1h"},
+}
+
+TIMEFRAME_SECONDS = {"5m": 300, "15m": 900, "1h": 3600}
+
+WINDOW_SECONDS = 900  # 15 minutes (default)
 
 
 @dataclass
@@ -51,6 +61,27 @@ def get_current_window_timestamp() -> int:
 def get_next_window_timestamp() -> int:
     """Get the Unix timestamp for the next 15-minute window start."""
     return get_current_window_timestamp() + WINDOW_SECONDS
+
+
+def discover_market_tf(coin: str, timeframe: str = "15m") -> CryptoMarket | None:
+    """Discover the current active market for a coin and timeframe (5m/15m/1h)."""
+    patterns = COIN_SLUG_PATTERNS.get(coin, {})
+    prefix = patterns.get(timeframe)
+    if not prefix:
+        return None
+
+    tf_secs = TIMEFRAME_SECONDS.get(timeframe, 900)
+    now = int(time.time())
+    window_ts = (now // tf_secs) * tf_secs
+    next_ts = window_ts + tf_secs
+
+    for ts in [window_ts, next_ts]:
+        slug = f"{prefix}-{ts}"
+        market = fetch_market_by_slug(slug, coin)
+        if market and market.is_active:
+            return market
+
+    return None
 
 
 def discover_market(coin: str) -> CryptoMarket | None:
