@@ -227,6 +227,12 @@ def cmd_weather2():
     weather2_main()
 
 
+def cmd_v7():
+    """Run V7 dump-and-hedge engine."""
+    from arb_engine_v7 import main as v7_main
+    v7_main()
+
+
 def cmd_positions():
     """Show current positions and P&L."""
     show_positions()
@@ -248,6 +254,7 @@ def main():
         "dual": cmd_dual,
         "v6": cmd_v6,
         "weather2": cmd_weather2,
+        "v7": cmd_v7,
     }
 
     if cmd in commands:
