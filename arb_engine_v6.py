@@ -412,6 +412,45 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
                 mm_state.sell_price = 0
                 mm_state.inventory_up = 0
                 mm_state.inventory_down = 0
+
+            # One-sided fill protection (same as requote path)
+            elif mm_state.buy_filled and not mm_state.sell_filled and not is_paper:
+                # Wait one more cycle, then unwind
+                if not hasattr(mm_state, '_one_sided_since'):
+                    mm_state._one_sided_since = time.time()
+                elif time.time() - mm_state._one_sided_since > 5:  # 5 sec grace period
+                    try:
+                        from py_clob_client.order_builder.constants import SELL as SELL_SIDE
+                        sell_price_back = round(mm_state.buy_price - 0.01, 2)
+                        if sell_price_back > 0.01 and mm_state.inventory_up > 0:
+                            args = OrderArgs(token_id=market.up_token_id, price=sell_price_back, size=mm_state.inventory_up, side=SELL_SIDE)
+                            signed = client.create_order(args)
+                            client.post_order(signed, OrderType.GTC)
+                            console.print(f"  [yellow]📊 MM UNWIND: {market.coin} sold UP back[/yellow]")
+                    except Exception:
+                        pass
+                    mm_state.buy_filled = False
+                    mm_state.inventory_up = 0
+                    mm_state._one_sided_since = None
+
+            elif mm_state.sell_filled and not mm_state.buy_filled and not is_paper:
+                if not hasattr(mm_state, '_one_sided_since'):
+                    mm_state._one_sided_since = time.time()
+                elif time.time() - mm_state._one_sided_since > 5:
+                    try:
+                        from py_clob_client.order_builder.constants import SELL as SELL_SIDE
+                        down_px = round(1.0 - mm_state.sell_price, 2)
+                        sell_price_back = round(down_px - 0.01, 2)
+                        if sell_price_back > 0.01 and mm_state.inventory_down > 0:
+                            args = OrderArgs(token_id=market.down_token_id, price=sell_price_back, size=mm_state.inventory_down, side=SELL_SIDE)
+                            signed = client.create_order(args)
+                            client.post_order(signed, OrderType.GTC)
+                            console.print(f"  [yellow]📊 MM UNWIND: {market.coin} sold DOWN back[/yellow]")
+                    except Exception:
+                        pass
+                    mm_state.sell_filled = False
+                    mm_state.inventory_down = 0
+                    mm_state._one_sided_since = None
         return
 
     # Inventory skew — widen the side we're long
@@ -444,46 +483,42 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
         from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY
 
-        # Check fills on existing orders before cancelling
+        # ── Check fills on existing orders before requoting ──
+        buy_matched = 0
+        sell_matched = 0
+
         if mm_state.buy_order_id and not mm_state.buy_filled:
             try:
                 order = client.get_order(mm_state.buy_order_id)
-                matched = float(order.get("size_matched", 0)) if isinstance(order, dict) else float(getattr(order, "size_matched", 0))
-                if matched > 0:
+                buy_matched = float(order.get("size_matched", 0)) if isinstance(order, dict) else float(getattr(order, "size_matched", 0))
+                if buy_matched > 0:
                     mm_state.buy_filled = True
-                    mm_state.inventory_up += matched
-                    cost = round(mm_state.buy_price * matched, 2)
-                    console.print(f"  [cyan]📊 MM BUY FILL (pre-requote): {market.coin} UP @ ${mm_state.buy_price:.2f} ({matched:.1f} shares)[/cyan]")
-                    _send_tg(f"📊 MM BUY FILL: {market.coin} UP @ ${mm_state.buy_price:.2f} ({matched:.1f} shares, ${cost:.2f})")
+                    mm_state.inventory_up += buy_matched
+                    console.print(f"  [cyan]📊 MM BUY FILL: {market.coin} UP @ ${mm_state.buy_price:.2f} ({buy_matched:.1f} shares)[/cyan]")
                 else:
                     client.cancel(mm_state.buy_order_id)
             except Exception:
-                try:
-                    client.cancel(mm_state.buy_order_id)
-                except Exception:
-                    pass
+                try: client.cancel(mm_state.buy_order_id)
+                except Exception: pass
 
         if mm_state.sell_order_id and not mm_state.sell_filled:
             try:
                 order = client.get_order(mm_state.sell_order_id)
-                matched = float(order.get("size_matched", 0)) if isinstance(order, dict) else float(getattr(order, "size_matched", 0))
-                if matched > 0:
+                sell_matched = float(order.get("size_matched", 0)) if isinstance(order, dict) else float(getattr(order, "size_matched", 0))
+                if sell_matched > 0:
                     mm_state.sell_filled = True
+                    mm_state.inventory_down += sell_matched
                     down_price = round(1.0 - mm_state.sell_price, 2)
-                    mm_state.inventory_down += matched
-                    cost = round(down_price * matched, 2)
-                    console.print(f"  [cyan]📊 MM SELL FILL (pre-requote): {market.coin} DOWN @ ${down_price:.2f} ({matched:.1f} shares)[/cyan]")
-                    _send_tg(f"📊 MM SELL FILL: {market.coin} DOWN @ ${down_price:.2f} ({matched:.1f} shares, ${cost:.2f})")
+                    console.print(f"  [cyan]📊 MM SELL FILL: {market.coin} DOWN @ ${down_price:.2f} ({sell_matched:.1f} shares)[/cyan]")
                 else:
                     client.cancel(mm_state.sell_order_id)
             except Exception:
-                try:
-                    client.cancel(mm_state.sell_order_id)
-                except Exception:
-                    pass
+                try: client.cancel(mm_state.sell_order_id)
+                except Exception: pass
 
-        # Check for round-trip before posting new quotes
+        # ── Handle outcomes ──
         if mm_state.buy_filled and mm_state.sell_filled:
+            # BOTH SIDES FILLED = spread profit (the goal)
             spread_profit = round(V6_MM_SPREAD * min(mm_state.inventory_up, mm_state.inventory_down), 2)
             bankroll.mm_pool += spread_profit
             bankroll.mm_pnl.wins += 1
@@ -498,6 +533,61 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
             mm_state.inventory_up = 0
             mm_state.inventory_down = 0
 
+        elif mm_state.buy_filled and not mm_state.sell_filled:
+            # ONE-SIDED: bought UP but DOWN didn't fill
+            # SELL BACK the UP position immediately to avoid directional risk
+            try:
+                from py_clob_client.order_builder.constants import SELL as SELL_SIDE
+                sell_back_price = round(mm_state.buy_price - 0.01, 2)  # Sell 1 cent below buy = small loss
+                if sell_back_price > 0.01:
+                    sell_args = OrderArgs(
+                        token_id=market.up_token_id,
+                        price=sell_back_price,
+                        size=mm_state.inventory_up,
+                        side=SELL_SIDE,
+                    )
+                    signed = client.create_order(sell_args)
+                    client.post_order(signed, OrderType.GTC)
+                    loss = round(0.01 * mm_state.inventory_up, 2)
+                    bankroll.mm_pnl.total_pnl -= loss
+                    console.print(f"  [yellow]📊 MM UNWIND: {market.coin} sold UP back (-${loss:.2f} to avoid directional risk)[/yellow]")
+                else:
+                    console.print(f"  [yellow]📊 MM UNWIND: {market.coin} price too low to sell back[/yellow]")
+            except Exception as e:
+                console.print(f"  [dim]MM unwind failed: {e}[/dim]")
+            mm_state.buy_filled = False
+            mm_state.sell_filled = False
+            mm_state.inventory_up = 0
+            mm_state.inventory_down = 0
+
+        elif mm_state.sell_filled and not mm_state.buy_filled:
+            # ONE-SIDED: bought DOWN but UP didn't fill
+            # SELL BACK the DOWN position immediately
+            try:
+                from py_clob_client.order_builder.constants import SELL as SELL_SIDE
+                down_buy_px = round(1.0 - mm_state.sell_price, 2)
+                sell_back_price = round(down_buy_px - 0.01, 2)
+                if sell_back_price > 0.01:
+                    sell_args = OrderArgs(
+                        token_id=market.down_token_id,
+                        price=sell_back_price,
+                        size=mm_state.inventory_down,
+                        side=SELL_SIDE,
+                    )
+                    signed = client.create_order(sell_args)
+                    client.post_order(signed, OrderType.GTC)
+                    loss = round(0.01 * mm_state.inventory_down, 2)
+                    bankroll.mm_pnl.total_pnl -= loss
+                    console.print(f"  [yellow]📊 MM UNWIND: {market.coin} sold DOWN back (-${loss:.2f} to avoid directional risk)[/yellow]")
+                else:
+                    console.print(f"  [yellow]📊 MM UNWIND: {market.coin} price too low to sell back[/yellow]")
+            except Exception as e:
+                console.print(f"  [dim]MM unwind failed: {e}[/dim]")
+            mm_state.buy_filled = False
+            mm_state.sell_filled = False
+            mm_state.inventory_up = 0
+            mm_state.inventory_down = 0
+
         mm_state.buy_order_id = None
         mm_state.sell_order_id = None
 
@@ -505,19 +595,6 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
         # "Sell UP" = Buy DOWN at complementary price
         down_buy_price = round(1.0 - sell_price, 2)
         sell_size = max(5, math.floor((V6_MM_SIZE / down_buy_price) * 100) / 100)
-
-        # Position limit check — don't over-extend
-        order_cost = round(buy_price * buy_size + down_buy_price * sell_size, 2)
-        if not can_place_order(market.coin, order_cost):
-            total = get_total_deployed()
-            coin_total = get_coin_deployed(market.coin)
-            console.print(
-                f"  [yellow]📊 MM SKIP {market.coin}: Position limit "
-                f"(total: ${total:.0f}/${V6_MAX_TOTAL_DEPLOYED:.0f}, "
-                f"{market.coin}: ${coin_total:.0f}/${V6_MAX_PER_COIN:.0f})[/yellow]"
-            )
-            mm_state.last_midpoint = mid
-            return
 
         try:
             # Post buy side (UP token)
@@ -789,16 +866,78 @@ def can_place_order(coin: str, order_cost: float) -> bool:
 # Auto-Claim: Sell resolved winning positions to recycle USDC
 # ══════════════════════════════════════════════════════════════════════
 
+_redeem_service = None
+
+
+def _get_redeem_service(client):
+    """Initialize poly-web3 redeem service with Builder credentials (cached)."""
+    global _redeem_service
+    if _redeem_service is not None:
+        return _redeem_service
+
+    try:
+        from poly_web3 import PolyWeb3Service, RelayClient, RELAYER_URL
+        from py_builder_signing_sdk.config import BuilderConfig
+        from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
+
+        builder_key = os.getenv("POLY_BUILDER_API_KEY", "")
+        builder_secret = os.getenv("POLY_BUILDER_SECRET", "")
+        builder_pass = os.getenv("POLY_BUILDER_PASSPHRASE", "")
+
+        if not all([builder_key, builder_secret, builder_pass]):
+            console.print("  [dim]Builder keys not configured — auto-redeem disabled[/dim]")
+            return None
+
+        builder_config = BuilderConfig(
+            local_builder_creds=BuilderApiKeyCreds(
+                key=builder_key,
+                secret=builder_secret,
+                passphrase=builder_pass,
+            )
+        )
+
+        relayer = RelayClient(
+            private_key=os.getenv("PRIVATE_KEY", ""),
+            relayer_url=RELAYER_URL,
+            chain_id=137,
+            builder_config=builder_config,
+        )
+
+        _redeem_service = PolyWeb3Service(
+            clob_client=client,
+            relayer_client=relayer,
+            rpc_url="https://polygon-bor-rpc.publicnode.com",
+        )
+        console.print(f"  [green]💰 Auto-redeem service initialized (wallet: {_redeem_service.wallet_type})[/green]")
+        return _redeem_service
+
+    except Exception as e:
+        console.print(f"  [dim]Redeem service init failed: {type(e).__name__}: {e}[/dim]")
+        return None
+
+
 async def auto_claim_resolved(client, bankroll: Bankroll):
-    """Sell resolved winning positions at $0.99 to free up USDC.
+    """Auto-redeem resolved winning positions via Builder API + poly-web3.
 
-    Polymarket has no redeem API — the workaround is to sell winners
-    at $0.99/share. Loses $0.01/share but instantly recycles cash.
+    Uses Polymarket's Relayer to gaslessly redeem CTF positions.
+    Falls back to Telegram reminder if redeem fails.
     """
-    from py_clob_client.clob_types import OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import SELL
-    import requests
+    service = _get_redeem_service(client)
 
+    if service is not None:
+        try:
+            result = service.redeem_all(batch_size=10)
+            if result and any(r is not None for r in result):
+                redeemed_count = sum(1 for r in result if r is not None)
+                msg = f"💰 AUTO-REDEEMED: {redeemed_count} positions claimed!"
+                console.print(f"  [bold green]{msg}[/bold green]")
+                _send_tg(msg)
+                return redeemed_count
+        except Exception as e:
+            console.print(f"  [dim]Auto-redeem failed: {type(e).__name__}: {e}[/dim]")
+
+    # Fallback: check for claimable positions and send reminder
+    import requests
     try:
         wallet = os.getenv("WALLET_ADDRESS", "")
         resp = requests.get(
@@ -807,54 +946,28 @@ async def auto_claim_resolved(client, bankroll: Bankroll):
         )
         positions = resp.json()
 
-        claimed_total = 0
+        claimable_total = 0
+        claimable_count = 0
         for pos in positions:
             size = float(pos.get("size", 0))
             price = float(pos.get("curPrice", 0) or 0)
-            token_id = pos.get("tokenId", "") or pos.get("token_id", "")
-            title = pos.get("title", "")[:40]
+            if size >= 1 and price >= 0.95:
+                claimable_total += size * 0.99
+                claimable_count += 1
 
-            if size < 1 or not token_id:
-                continue
-
-            # Only sell positions that have resolved (price at $0.95+)
-            if price >= 0.95:
-                sell_price = 0.99
-                sell_size = math.floor(size * 100) / 100
-
-                if sell_size < 1:
-                    continue
-
-                try:
-                    order_args = OrderArgs(
-                        token_id=token_id,
-                        price=sell_price,
-                        size=sell_size,
-                        side=SELL,
-                    )
-                    signed = client.create_order(order_args)
-                    resp = client.post_order(signed, OrderType.GTC)
-                    oid = _extract_order_id(resp)
-
-                    if oid:
-                        usdc_back = round(sell_price * sell_size, 2)
-                        claimed_total += usdc_back
-                        console.print(
-                            f"  [green]💰 AUTO-CLAIM: Sold {sell_size:.0f} shares of {title} "
-                            f"@ ${sell_price} → ${usdc_back:.2f} USDC freed[/green]"
-                        )
-                except Exception as e:
-                    console.print(f"  [dim]Auto-claim failed for {title}: {e}[/dim]")
-
-        if claimed_total > 0:
-            msg = f"💰 AUTO-CLAIMED: ${claimed_total:.2f} USDC recycled from resolved positions"
-            console.print(f"  [bold green]{msg}[/bold green]")
-            _send_tg(msg)
-            bankroll.mm_pool += claimed_total  # Add back to MM pool
-            return claimed_total
-
-    except Exception as e:
-        console.print(f"  [dim]Auto-claim check failed: {e}[/dim]")
+        if claimable_count > 0 and claimable_total > 10:
+            last_alert = getattr(bankroll, '_last_claim_alert', 0)
+            if time.time() - last_alert >= 900:
+                bankroll._last_claim_alert = time.time()
+                msg = (
+                    f"💰 CLAIM REMINDER\n"
+                    f"{claimable_count} positions worth ${claimable_total:.2f}\n"
+                    f"Auto-redeem failed — claim at polymarket.com"
+                )
+                console.print(f"  [bold yellow]{msg}[/bold yellow]")
+                _send_tg(msg)
+    except Exception:
+        pass
 
     return 0
 
@@ -1046,12 +1159,15 @@ async def run_v6_engine():
                 console.print(f"  {bankroll.status_line()}")
                 status_counter = 0
 
-            # ── Auto-claim every 60 seconds ──
-            if not PAPER_TRADE and now % 60 < 2:
+            # ── Auto-claim every 60 seconds (use dedicated timer) ──
+            current_time = int(time.time())
+            if not PAPER_TRADE and (current_time - getattr(bankroll, '_last_claim', 0)) >= 60:
+                bankroll._last_claim = current_time
                 await auto_claim_resolved(client, bankroll)
 
             # ── Telegram status every 5 minutes ──
-            if now % 300 < 2:
+            if (current_time - getattr(bankroll, '_last_tg', 0)) >= 300:
+                bankroll._last_tg = current_time
                 _send_tg(
                     f"📈 V6 Status\n"
                     f"{bankroll.status_line()}\n"
