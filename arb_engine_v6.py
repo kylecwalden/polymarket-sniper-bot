@@ -162,7 +162,17 @@ def _parse_book_side(entries) -> list[tuple[float, float]]:
 
 
 def get_best_ask(client, token_id: str) -> Optional[tuple[float, float]]:
-    """Get (price, size) of best ask for a token."""
+    """Get (price, size) of best ask — WebSocket first, REST fallback."""
+    # Try WebSocket (sub-100ms)
+    try:
+        from polymarket_ws import orderbook_feed
+        ws_result = orderbook_feed.get_best_ask(token_id)
+        if ws_result:
+            return ws_result
+    except Exception:
+        pass
+
+    # Fallback to REST polling
     try:
         book = client.get_order_book(token_id)
         asks_raw = book.get("asks", []) if isinstance(book, dict) else getattr(book, "asks", [])
@@ -177,7 +187,15 @@ def get_best_ask(client, token_id: str) -> Optional[tuple[float, float]]:
 
 
 def get_best_bid(client, token_id: str) -> Optional[tuple[float, float]]:
-    """Get (price, size) of best bid for a token."""
+    """Get (price, size) of best bid — WebSocket first, REST fallback."""
+    try:
+        from polymarket_ws import orderbook_feed
+        ws_result = orderbook_feed.get_best_bid(token_id)
+        if ws_result:
+            return ws_result
+    except Exception:
+        pass
+
     try:
         book = client.get_order_book(token_id)
         bids_raw = book.get("bids", []) if isinstance(book, dict) else getattr(book, "bids", [])
@@ -192,7 +210,15 @@ def get_best_bid(client, token_id: str) -> Optional[tuple[float, float]]:
 
 
 def get_midpoint(client, token_id: str) -> Optional[float]:
-    """Get midpoint price for a token."""
+    """Get midpoint price — WebSocket first, REST fallback."""
+    try:
+        from polymarket_ws import orderbook_feed
+        ws_mid = orderbook_feed.get_midpoint(token_id)
+        if ws_mid:
+            return ws_mid
+    except Exception:
+        pass
+
     bid = get_best_bid(client, token_id)
     ask = get_best_ask(client, token_id)
     if bid and ask:
@@ -1049,6 +1075,11 @@ async def run_v6_engine():
     # Start Binance WebSocket
     ws_task = asyncio.create_task(connect_binance())
 
+    # Start Polymarket orderbook WebSocket
+    from polymarket_ws import orderbook_feed
+    poly_ws_task = asyncio.create_task(orderbook_feed.run())
+    console.print("  [green]Polymarket WebSocket: Starting...[/green]")
+
     # ── Init state ──
     bankroll = Bankroll(starting=V6_BANKROLL)
     windows: dict[str, WindowState] = {}
@@ -1083,6 +1114,9 @@ async def run_v6_engine():
                 market = discover_market_tf(coin, tf)
                 if not market or not market.is_active:
                     continue
+
+                # Subscribe to WebSocket orderbook for this market
+                orderbook_feed.subscribe(market)
 
                 # ── Window management ──
                 window = windows.get(market_key)
@@ -1171,7 +1205,8 @@ async def run_v6_engine():
                 _send_tg(
                     f"📈 V6 Status\n"
                     f"{bankroll.status_line()}\n"
-                    f"Markets: {len(V6_COINS)} coins × {len(V6_TIMEFRAMES)} timeframes"
+                    f"Markets: {len(V6_COINS)} coins × {len(V6_TIMEFRAMES)} timeframes\n"
+                    f"WS: {orderbook_feed.stats}"
                 )
 
             await asyncio.sleep(V6_HEDGE_POLL_INTERVAL)
@@ -1181,6 +1216,7 @@ async def run_v6_engine():
         console.print(f"\n  {bankroll.status_line()}")
     finally:
         ws_task.cancel()
+        poly_ws_task.cancel()
 
 
 def main():
