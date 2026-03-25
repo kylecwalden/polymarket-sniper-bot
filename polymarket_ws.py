@@ -226,8 +226,14 @@ class OrderbookFeed:
 
                     self._pending_subs.clear()
 
-                    # Process messages
-                    async for raw_msg in ws:
+                    # Process messages with timeout to detect zombie connections
+                    while True:
+                        try:
+                            raw_msg = await asyncio.wait_for(ws.recv(), timeout=30)
+                        except asyncio.TimeoutError:
+                            print("[polymarket-ws] No message in 30s — forcing reconnect")
+                            break
+
                         try:
                             self._last_message_time = time.time()
 

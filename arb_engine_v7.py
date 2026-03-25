@@ -60,23 +60,81 @@ V7_MAX_OPEN_HEDGES = int(os.getenv("V7_MAX_OPEN_HEDGES", "4"))      # Max concur
 # ══════════════════════════════════════════════════════════════════════
 
 @dataclass
+class TradeRecord:
+    """Single trade result for history."""
+    timestamp: float
+    coin: str
+    tf: str
+    trade_type: str  # "hedge", "unwind", "loss"
+    profit: float
+    leg1_price: float = 0.0
+    leg2_price: float = 0.0
+    size: float = 0.0
+
+
+@dataclass
 class PnLTracker:
     wins: int = 0
     losses: int = 0
     unwinds: int = 0
     total_pnl: float = 0.0
     trades: int = 0
+    history: list = field(default_factory=list)
+    # Per-coin tracking
+    coin_pnl: dict = field(default_factory=lambda: {})
+    # Per-timeframe tracking
+    tf_pnl: dict = field(default_factory=lambda: {"5m": 0.0, "15m": 0.0})
 
     @property
     def win_rate(self) -> float:
         total = self.wins + self.losses + self.unwinds
         return (self.wins / total * 100) if total > 0 else 0
 
+    def record(self, trade_type: str, coin: str, tf: str, profit: float,
+               leg1_price: float = 0, leg2_price: float = 0, size: float = 0):
+        """Record a trade result."""
+        rec = TradeRecord(
+            timestamp=time.time(), coin=coin, tf=tf, trade_type=trade_type,
+            profit=profit, leg1_price=leg1_price, leg2_price=leg2_price, size=size,
+        )
+        self.history.append(rec)
+        self.total_pnl += profit
+        self.trades += 1
+
+        # Per-coin
+        if coin not in self.coin_pnl:
+            self.coin_pnl[coin] = {"pnl": 0.0, "wins": 0, "unwinds": 0}
+        self.coin_pnl[coin]["pnl"] += profit
+        if trade_type == "hedge":
+            self.coin_pnl[coin]["wins"] += 1
+        elif trade_type == "unwind":
+            self.coin_pnl[coin]["unwinds"] += 1
+
+        # Per-timeframe
+        if tf in self.tf_pnl:
+            self.tf_pnl[tf] += profit
+
     def summary(self) -> str:
         return (
             f"{self.wins}W/{self.losses}L/{self.unwinds}U "
             f"({self.win_rate:.0f}%) ${self.total_pnl:+.2f}"
         )
+
+    def detailed_summary(self) -> str:
+        """Per-coin and per-timeframe breakdown."""
+        lines = []
+        for coin in sorted(self.coin_pnl.keys()):
+            c = self.coin_pnl[coin]
+            lines.append(f"  {coin}: {c['wins']}W/{c['unwinds']}U ${c['pnl']:+.2f}")
+        if self.tf_pnl["5m"] != 0 or self.tf_pnl["15m"] != 0:
+            lines.append(f"  5m: ${self.tf_pnl['5m']:+.2f} | 15m: ${self.tf_pnl['15m']:+.2f}")
+        # Last 5 trades
+        if self.history:
+            lines.append("  Recent:")
+            for rec in self.history[-5:]:
+                icon = "🔄" if rec.trade_type == "hedge" else "⏰"
+                lines.append(f"    {icon} {rec.coin}/{rec.tf} ${rec.profit:+.2f}")
+        return "\n".join(lines)
 
 
 @dataclass
@@ -95,10 +153,29 @@ class Bankroll:
 
     def status_line(self) -> str:
         return (
-            f"Bankroll: ${self.balance:.2f} | "
-            f"P&L: ${self.balance - self.starting:+.2f} | "
-            f"{self.pnl.summary()}"
+            f"P&L: ${self.pnl.total_pnl:+.2f} | "
+            f"Cash: ${self.balance:.2f} | "
+            f"{self.pnl.summary()} | "
+            f"Deployed: ${self.starting - self.balance:.2f}"
         )
+
+    def full_report(self) -> str:
+        """Detailed P&L report for Telegram."""
+        lines = [
+            f"📊 V7 P&L Report",
+            f"Total: ${self.pnl.total_pnl:+.2f} | Cash: ${self.balance:.2f}",
+            f"Record: {self.pnl.summary()}",
+            f"",
+        ]
+        # Per coin
+        for coin in sorted(self.pnl.coin_pnl.keys()):
+            c = self.pnl.coin_pnl[coin]
+            lines.append(f"{coin}: {c['wins']}W/{c['unwinds']}U ${c['pnl']:+.2f}")
+        # Per timeframe
+        if self.pnl.tf_pnl["5m"] != 0 or self.pnl.tf_pnl["15m"] != 0:
+            lines.append(f"")
+            lines.append(f"5m: ${self.pnl.tf_pnl['5m']:+.2f} | 15m: ${self.pnl.tf_pnl['15m']:+.2f}")
+        return "\n".join(lines)
 
 
 @dataclass
@@ -211,6 +288,7 @@ async def execute_leg1(client, market, dump_info: dict, bankroll: Bankroll, is_p
     ask_price = round(dump_info["current_ask"], 2)
     size = V7_SHARES_PER_TRADE
     cost = round(ask_price * size, 2)
+    tf = "5m" if "5m" in market.slug else "15m" if "15m" in market.slug else "1h"
 
     if cost > bankroll.balance or cost < 1:
         return None
@@ -240,7 +318,7 @@ async def execute_leg1(client, market, dump_info: dict, bankroll: Bankroll, is_p
     bankroll.balance -= cost
 
     msg = (
-        f"🎯 {ptag}LEG 1: {market.coin} {side.upper()} @ ${ask_price:.2f}\n"
+        f"🎯 {ptag}LEG 1: {market.coin}/{tf} {side.upper()} @ ${ask_price:.2f}\n"
         f"{size} shares (${cost:.2f}) | Drop: {dump_info['drop_pct']:.0%} from ${dump_info['high']:.2f}\n"
         f"Need Leg 2 @ ≤${leg2_target:.2f} for hedge"
     )
@@ -250,7 +328,7 @@ async def execute_leg1(client, market, dump_info: dict, bankroll: Bankroll, is_p
     return OpenHedge(
         hedge_id=hedge_id,
         coin=market.coin,
-        tf="",
+        tf=tf,
         leg1_side=side,
         leg1_price=ask_price,
         leg1_size=size,
@@ -302,12 +380,12 @@ async def attempt_leg2(client, hedge: OpenHedge, opposite_ask: float, bankroll: 
 
     bankroll.balance += size * 1.00  # One side will pay $1.00
     bankroll.pnl.wins += 1
-    bankroll.pnl.total_pnl += profit
-    bankroll.pnl.trades += 1
+    bankroll.pnl.record("hedge", hedge.coin, hedge.tf, profit,
+                        leg1_price=hedge.leg1_price, leg2_price=ask_price, size=size)
 
     opposite_side = "down" if hedge.leg1_side == "up" else "up"
     msg = (
-        f"🔄 {ptag}HEDGED: {hedge.coin}\n"
+        f"🔄 {ptag}HEDGED: {hedge.coin}/{hedge.tf}\n"
         f"Leg 1: {hedge.leg1_side.upper()} @ ${hedge.leg1_price:.2f}\n"
         f"Leg 2: {opposite_side.upper()} @ ${ask_price:.2f}\n"
         f"Sum: ${hedge.leg1_price + ask_price:.2f} → +${profit:.2f} profit"
@@ -341,12 +419,12 @@ async def unwind_leg1(client, hedge: OpenHedge, bankroll: Bankroll, is_paper: bo
 
     bankroll.balance += hedge.leg1_cost - loss
     bankroll.pnl.unwinds += 1
-    bankroll.pnl.total_pnl -= loss
-    bankroll.pnl.trades += 1
+    bankroll.pnl.record("unwind", hedge.coin, hedge.tf, -loss,
+                        leg1_price=hedge.leg1_price, size=hedge.leg1_size)
     bankroll.daily_losses += loss
 
     msg = (
-        f"⏰ {ptag}UNWIND: {hedge.coin} {hedge.leg1_side.upper()}\n"
+        f"⏰ {ptag}UNWIND: {hedge.coin}/{hedge.tf} {hedge.leg1_side.upper()}\n"
         f"No hedge found in {V7_MAX_WAIT_SECONDS}s → sold back (-${loss:.2f})"
     )
     console.print(f"  [yellow]{msg}[/yellow]")
@@ -556,12 +634,7 @@ async def run_v7_engine():
             current_time = int(time.time())
             if (current_time - getattr(bankroll, '_last_tg', 0)) >= 300:
                 bankroll._last_tg = current_time
-                _send_tg(
-                    f"📈 V7 Dump-and-Hedge\n"
-                    f"{bankroll.status_line()}\n"
-                    f"Open hedges: {len(open_hedges)}\n"
-                    f"WS: {orderbook_feed.stats}"
-                )
+                _send_tg(f"{bankroll.full_report()}\nOpen hedges: {len(open_hedges)}\nWS: {orderbook_feed.stats}")
 
             # ── Auto-redeem every 60s ──
             if not PAPER_TRADE and (current_time - getattr(bankroll, '_last_claim', 0)) >= 60:
