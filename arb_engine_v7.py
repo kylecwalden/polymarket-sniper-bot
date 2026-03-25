@@ -537,8 +537,14 @@ async def run_v7_engine():
             # ── Check open hedges: attempt Leg 2 or unwind ──
             resolved_hedges = []
             for hedge in open_hedges:
-                # Get opposite side's current ask via WebSocket
+                # Get opposite side's current ask — WebSocket first, REST fallback
                 opposite_ask_data = orderbook_feed.get_best_ask(hedge.leg2_token_id)
+                if not opposite_ask_data:
+                    try:
+                        from arb_engine_v6 import get_best_ask as rest_get_best_ask
+                        opposite_ask_data = rest_get_best_ask(client, hedge.leg2_token_id)
+                    except Exception:
+                        pass
                 if opposite_ask_data:
                     opposite_ask = opposite_ask_data[0]
 
@@ -603,9 +609,20 @@ async def run_v7_engine():
                     if len(open_hedges) >= V7_MAX_OPEN_HEDGES:
                         continue
 
-                    # Get current prices via WebSocket
+                    # Get current prices — WebSocket first, REST fallback
                     up_ask_data = orderbook_feed.get_best_ask(market.up_token_id)
                     down_ask_data = orderbook_feed.get_best_ask(market.down_token_id)
+
+                    if not up_ask_data or not down_ask_data:
+                        # REST fallback
+                        try:
+                            from arb_engine_v6 import get_best_ask as rest_get_best_ask
+                            if not up_ask_data:
+                                up_ask_data = rest_get_best_ask(client, market.up_token_id)
+                            if not down_ask_data:
+                                down_ask_data = rest_get_best_ask(client, market.down_token_id)
+                        except Exception:
+                            pass
 
                     if not up_ask_data or not down_ask_data:
                         continue
