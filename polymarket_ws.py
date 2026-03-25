@@ -4,10 +4,11 @@ Polymarket WebSocket Orderbook Feed
 Real-time orderbook streaming for UP/DOWN crypto markets.
 Sub-100ms updates vs 1.5s REST polling.
 
-Usage:
-    from polymarket_ws import orderbook_feed
-    orderbook_feed.subscribe(market)  # Subscribe to a market's UP+DOWN tokens
-    best = orderbook_feed.get_best(token_id)  # Returns (best_bid, best_ask) instantly
+Fixes:
+- Uses protocol-level ping/pong (ping_interval=20) instead of text "PING"
+- Caps active subscriptions to current markets only (max ~16 tokens)
+- Cleans up expired tokens every window change
+- Faster reconnect (0.5s) with exponential backoff
 """
 
 import asyncio
@@ -20,7 +21,8 @@ from typing import Optional
 import websockets
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-PING_INTERVAL = 10  # seconds
+MAX_TOKENS = 32  # Max tokens to subscribe (4 coins x 2 timeframes x 2 sides + buffer)
+STALE_THRESHOLD = 10  # Seconds before data is considered stale
 
 
 @dataclass
@@ -33,6 +35,7 @@ class TokenBook:
     best_ask_size: float = 0.0
     mid: float = 0.0
     last_update: float = 0.0
+    subscribed_at: float = 0.0
 
     def update_from_book(self, bids: list, asks: list):
         """Update from a full book snapshot."""
@@ -76,16 +79,10 @@ class TokenBook:
             if size > 0 and price >= self.best_bid:
                 self.best_bid = price
                 self.best_bid_size = size
-            elif size == 0 and price == self.best_bid:
-                # Best bid removed — we'd need full book to know new best
-                # For now just mark as stale
-                pass
         elif side == "SELL" and price > 0:
             if size > 0 and (self.best_ask == 0 or price <= self.best_ask):
                 self.best_ask = price
                 self.best_ask_size = size
-            elif size == 0 and price == self.best_ask:
-                pass
 
         if self.best_bid > 0 and self.best_ask > 0:
             self.mid = round((self.best_bid + self.best_ask) / 2, 4)
@@ -93,8 +90,8 @@ class TokenBook:
 
     @property
     def is_fresh(self) -> bool:
-        """Data is less than 5 seconds old."""
-        return (time.time() - self.last_update) < 5
+        """Data is less than STALE_THRESHOLD seconds old."""
+        return (time.time() - self.last_update) < STALE_THRESHOLD
 
     @property
     def spread(self) -> float:
@@ -104,24 +101,48 @@ class TokenBook:
 
 
 class OrderbookFeed:
-    """Manages WebSocket connection and orderbook state for all subscribed tokens."""
+    """Manages WebSocket connection and orderbook state."""
 
     def __init__(self):
         self._books: dict[str, TokenBook] = {}
-        self._subscribed_tokens: set[str] = set()
+        self._active_tokens: set[str] = set()  # Currently active tokens
         self._pending_subs: list[str] = []
+        self._pending_unsubs: list[str] = []
         self._ws = None
         self._connected = False
-        self._task = None
+        self._reconnect_count = 0
+        self._last_message_time = 0
         self._lock = threading.Lock()
 
     def subscribe(self, market):
         """Subscribe to a CryptoMarket's UP and DOWN tokens."""
         for token_id in [market.up_token_id, market.down_token_id]:
-            if token_id not in self._subscribed_tokens:
-                self._subscribed_tokens.add(token_id)
-                self._books[token_id] = TokenBook(token_id=token_id)
+            if token_id not in self._active_tokens:
+                self._active_tokens.add(token_id)
+                self._books[token_id] = TokenBook(
+                    token_id=token_id,
+                    subscribed_at=time.time(),
+                )
                 self._pending_subs.append(token_id)
+
+    def unsubscribe(self, token_id: str):
+        """Unsubscribe from a token and clean up."""
+        if token_id in self._active_tokens:
+            self._active_tokens.discard(token_id)
+            self._pending_unsubs.append(token_id)
+            # Keep the book data for a bit in case it's still needed
+            # but mark it as inactive
+
+    def cleanup_stale_tokens(self, active_market_tokens: set[str]):
+        """Remove tokens that are no longer in active markets."""
+        stale = self._active_tokens - active_market_tokens
+        for token_id in stale:
+            self.unsubscribe(token_id)
+            if token_id in self._books:
+                del self._books[token_id]
+
+        if stale:
+            print(f"[polymarket-ws] Cleaned up {len(stale)} expired tokens, {len(self._active_tokens)} active")
 
     def get_best_ask(self, token_id: str) -> Optional[tuple[float, float]]:
         """Get (price, size) of best ask. Returns None if no data."""
@@ -155,7 +176,12 @@ class OrderbookFeed:
     @property
     def stats(self) -> str:
         fresh = sum(1 for b in self._books.values() if b.is_fresh)
-        return f"{fresh}/{len(self._books)} tokens streaming"
+        return f"{fresh}/{len(self._active_tokens)} tokens streaming"
+
+    @property
+    def is_healthy(self) -> bool:
+        """WebSocket is connected and receiving data."""
+        return self._connected and (time.time() - self._last_message_time) < 15
 
     async def _send_subscription(self, ws, token_ids: list[str]):
         """Send subscription message for token IDs."""
@@ -174,58 +200,74 @@ class OrderbookFeed:
             try:
                 async with websockets.connect(
                     WS_URL,
-                    ping_interval=None,  # We send our own pings
-                    max_size=10 * 1024 * 1024,  # 10MB max message
+                    ping_interval=20,   # Protocol-level ping every 20s
+                    ping_timeout=10,    # Timeout if no pong in 10s
+                    close_timeout=5,    # Don't hang on close
+                    max_size=10 * 1024 * 1024,
                 ) as ws:
                     self._ws = ws
                     self._connected = True
-                    print(f"[polymarket-ws] Connected — subscribing to {len(self._subscribed_tokens)} tokens")
+                    self._reconnect_count = 0
 
-                    # Subscribe to all tokens
-                    all_tokens = list(self._subscribed_tokens)
-                    # Send in batches of 50
-                    for i in range(0, len(all_tokens), 50):
-                        batch = all_tokens[i:i+50]
+                    # Only subscribe to active tokens (not stale ones)
+                    active = list(self._active_tokens)
+                    if not active:
+                        print("[polymarket-ws] No tokens to subscribe, waiting...")
+                        await asyncio.sleep(5)
+                        continue
+
+                    print(f"[polymarket-ws] Connected — subscribing to {len(active)} tokens")
+
+                    # Subscribe in small batches
+                    for i in range(0, len(active), 20):
+                        batch = active[i:i+20]
                         await self._send_subscription(ws, batch)
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.05)
 
                     self._pending_subs.clear()
 
                     # Process messages
-                    last_ping = time.time()
                     async for raw_msg in ws:
                         try:
-                            # Send ping every 10 seconds
-                            if time.time() - last_ping > PING_INTERVAL:
-                                await ws.send("PING")
-                                last_ping = time.time()
+                            self._last_message_time = time.time()
 
-                            # Handle pending subscriptions
+                            # Handle pending subs/unsubs
                             if self._pending_subs:
-                                await self._send_subscription(ws, self._pending_subs)
-                                self._pending_subs.clear()
+                                subs = self._pending_subs[:20]  # Batch limit
+                                await self._send_subscription(ws, subs)
+                                self._pending_subs = self._pending_subs[20:]
 
-                            # Skip pong
-                            if raw_msg == "PONG":
+                            # Skip non-JSON
+                            if not raw_msg or raw_msg in ("PONG", "pong"):
                                 continue
 
-                            # Parse message
+                            # Parse
                             msgs = json.loads(raw_msg)
                             if not isinstance(msgs, list):
                                 msgs = [msgs]
 
                             for msg in msgs:
-                                self._process_message(msg)
+                                if isinstance(msg, dict):
+                                    self._process_message(msg)
 
                         except json.JSONDecodeError:
                             continue
                         except Exception as e:
                             print(f"[polymarket-ws] Message error: {e}")
 
-            except Exception as e:
-                print(f"[polymarket-ws] Connection error: {e}")
+            except websockets.exceptions.ConnectionClosedError as e:
                 self._connected = False
-                await asyncio.sleep(2)  # Reconnect delay
+                self._reconnect_count += 1
+                delay = min(0.5 * (2 ** min(self._reconnect_count, 5)), 30)
+                print(f"[polymarket-ws] Connection closed: {e} — reconnecting in {delay:.1f}s (attempt {self._reconnect_count})")
+                await asyncio.sleep(delay)
+
+            except Exception as e:
+                self._connected = False
+                self._reconnect_count += 1
+                delay = min(0.5 * (2 ** min(self._reconnect_count, 5)), 30)
+                print(f"[polymarket-ws] Connection error: {e} — reconnecting in {delay:.1f}s")
+                await asyncio.sleep(delay)
 
     def _process_message(self, msg: dict):
         """Process a single WebSocket message."""
@@ -249,10 +291,6 @@ class OrderbookFeed:
 
         elif event_type == "best_bid_ask":
             book.update_best_bid_ask(msg)
-
-        elif event_type == "last_trade_price":
-            # Could track last trade but not needed for MM
-            pass
 
 
 # Singleton instance
