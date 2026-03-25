@@ -126,8 +126,9 @@ class PnLTracker:
         for coin in sorted(self.coin_pnl.keys()):
             c = self.coin_pnl[coin]
             lines.append(f"  {coin}: {c['wins']}W/{c['unwinds']}U ${c['pnl']:+.2f}")
-        if self.tf_pnl["5m"] != 0 or self.tf_pnl["15m"] != 0:
-            lines.append(f"  5m: ${self.tf_pnl['5m']:+.2f} | 15m: ${self.tf_pnl['15m']:+.2f}")
+        tf_parts = [f"{tf}: ${self.tf_pnl[tf]:+.2f}" for tf in ["5m", "15m", "1h"] if self.tf_pnl.get(tf, 0) != 0]
+        if tf_parts:
+            lines.append(f"  {' | '.join(tf_parts)}")
         # Last 5 trades
         if self.history:
             lines.append("  Recent:")
@@ -172,9 +173,10 @@ class Bankroll:
             c = self.pnl.coin_pnl[coin]
             lines.append(f"{coin}: {c['wins']}W/{c['unwinds']}U ${c['pnl']:+.2f}")
         # Per timeframe
-        if self.pnl.tf_pnl["5m"] != 0 or self.pnl.tf_pnl["15m"] != 0:
+        tf_parts = [f"{tf}: ${self.pnl.tf_pnl[tf]:+.2f}" for tf in ["5m", "15m", "1h"] if self.pnl.tf_pnl.get(tf, 0) != 0]
+        if tf_parts:
             lines.append(f"")
-            lines.append(f"5m: ${self.pnl.tf_pnl['5m']:+.2f} | 15m: ${self.pnl.tf_pnl['15m']:+.2f}")
+            lines.append(" | ".join(tf_parts))
         return "\n".join(lines)
 
 
