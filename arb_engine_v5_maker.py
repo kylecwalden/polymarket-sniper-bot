@@ -675,8 +675,15 @@ async def run_maker_bot():
                                 window.hedge_orders = hedge_orders
                             continue
                         else:
+                            # Log what the spread actually is
+                            up_ask = get_best_ask(client, market.up_token_id)
+                            down_ask = get_best_ask(client, market.down_token_id)
+                            if up_ask and down_ask:
+                                spread_sum = up_ask[0] + down_ask[0]
+                                console.print(f"  [dim]{coin}: No hedge (UP ${up_ask[0]:.2f} + DOWN ${down_ask[0]:.2f} = ${spread_sum:.2f} ≥ ${HEDGE_SUM_TARGET:.2f}) → directional[/dim]")
+                            else:
+                                console.print(f"  [dim]{coin}: No hedge (orderbook unavailable) → directional[/dim]")
                             if MAKER_STRATEGY == "hedge":
-                                console.print(f"  [dim]{coin}: No hedge (sum ≥ ${HEDGE_SUM_TARGET:.2f}) — SKIP[/dim]")
                                 window.order_placed = True
                                 continue
                             # hybrid: fall through to directional
