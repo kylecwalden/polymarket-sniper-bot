@@ -194,10 +194,31 @@ class OrderbookFeed:
         })
         await ws.send(msg)
 
+    def force_cleanup(self):
+        """Force remove all tokens except the most recent MAX_TOKENS."""
+        if len(self._active_tokens) > MAX_TOKENS:
+            # Keep only the most recently subscribed tokens
+            sorted_books = sorted(
+                [(tid, b) for tid, b in self._books.items() if tid in self._active_tokens],
+                key=lambda x: x[1].subscribed_at,
+                reverse=True,
+            )
+            keep = set(tid for tid, _ in sorted_books[:MAX_TOKENS])
+            stale = self._active_tokens - keep
+            for tid in stale:
+                self._active_tokens.discard(tid)
+                if tid in self._books:
+                    del self._books[tid]
+            print(f"[polymarket-ws] Force cleanup: removed {len(stale)} stale tokens, {len(self._active_tokens)} remaining")
+
     async def run(self):
         """Main WebSocket loop — connect, subscribe, process messages."""
         while True:
             try:
+                # Force cleanup if tokens are bloating
+                if len(self._active_tokens) > MAX_TOKENS:
+                    self.force_cleanup()
+
                 async with websockets.connect(
                     WS_URL,
                     ping_interval=20,   # Protocol-level ping every 20s
@@ -210,7 +231,7 @@ class OrderbookFeed:
                     self._reconnect_count = 0
 
                     # Only subscribe to active tokens (not stale ones)
-                    active = list(self._active_tokens)
+                    active = list(self._active_tokens)[:MAX_TOKENS]
                     if not active:
                         print("[polymarket-ws] No tokens to subscribe, waiting...")
                         await asyncio.sleep(5)
@@ -219,10 +240,10 @@ class OrderbookFeed:
                     print(f"[polymarket-ws] Connected — subscribing to {len(active)} tokens")
 
                     # Subscribe in small batches
-                    for i in range(0, len(active), 20):
-                        batch = active[i:i+20]
+                    for i in range(0, len(active), 10):
+                        batch = active[i:i+10]
                         await self._send_subscription(ws, batch)
-                        await asyncio.sleep(0.05)
+                        await asyncio.sleep(0.1)
 
                     self._pending_subs.clear()
 
@@ -264,15 +285,20 @@ class OrderbookFeed:
             except websockets.exceptions.ConnectionClosedError as e:
                 self._connected = False
                 self._reconnect_count += 1
-                delay = min(0.5 * (2 ** min(self._reconnect_count, 5)), 30)
+                delay = min(1.0 * (2 ** min(self._reconnect_count, 4)), 15)
                 print(f"[polymarket-ws] Connection closed: {e} — reconnecting in {delay:.1f}s (attempt {self._reconnect_count})")
+                # Force cleanup on repeated failures
+                if self._reconnect_count >= 3:
+                    self.force_cleanup()
                 await asyncio.sleep(delay)
 
             except Exception as e:
                 self._connected = False
                 self._reconnect_count += 1
-                delay = min(0.5 * (2 ** min(self._reconnect_count, 5)), 30)
+                delay = min(1.0 * (2 ** min(self._reconnect_count, 4)), 15)
                 print(f"[polymarket-ws] Connection error: {e} — reconnecting in {delay:.1f}s")
+                if self._reconnect_count >= 3:
+                    self.force_cleanup()
                 await asyncio.sleep(delay)
 
     def _process_message(self, msg: dict):
