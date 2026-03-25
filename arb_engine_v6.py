@@ -175,6 +175,8 @@ def get_best_ask(client, token_id: str) -> Optional[tuple[float, float]]:
     # Fallback to REST polling
     try:
         book = client.get_order_book(token_id)
+        if not isinstance(book, (dict,)) and not hasattr(book, 'asks'):
+            return None
         asks_raw = book.get("asks", []) if isinstance(book, dict) else getattr(book, "asks", [])
         asks = _parse_book_side(asks_raw)
         if not asks:
@@ -198,6 +200,8 @@ def get_best_bid(client, token_id: str) -> Optional[tuple[float, float]]:
 
     try:
         book = client.get_order_book(token_id)
+        if not isinstance(book, (dict,)) and not hasattr(book, 'bids'):
+            return None
         bids_raw = book.get("bids", []) if isinstance(book, dict) else getattr(book, "bids", [])
         bids = _parse_book_side(bids_raw)
         if not bids:
@@ -1177,7 +1181,10 @@ async def run_v6_engine():
                 if V6_MM_ENABLED and bankroll.mm_pool >= V6_MM_SIZE and secs_left > 60:
                     if market_key not in mm_states:
                         mm_states[market_key] = MMState(coin=coin)
-                    await manage_mm_quotes(client, market, mm_states[market_key], bankroll, PAPER_TRADE)
+                    try:
+                        await manage_mm_quotes(client, market, mm_states[market_key], bankroll, PAPER_TRADE)
+                    except Exception as e:
+                        console.print(f"  [dim]MM quote failed: {e}[/dim]")
 
                 # ── Priority 3: LATE ENTRY ──
                 if (V6_LATE_ENABLED
