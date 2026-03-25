@@ -83,7 +83,7 @@ class PnLTracker:
     # Per-coin tracking
     coin_pnl: dict = field(default_factory=lambda: {})
     # Per-timeframe tracking
-    tf_pnl: dict = field(default_factory=lambda: {"5m": 0.0, "15m": 0.0})
+    tf_pnl: dict = field(default_factory=lambda: {"5m": 0.0, "15m": 0.0, "1h": 0.0})
 
     @property
     def win_rate(self) -> float:
