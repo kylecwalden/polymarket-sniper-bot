@@ -120,13 +120,132 @@ class Bankroll:
     def can_trade(self) -> bool:
         return self.daily_losses < V6_DAILY_LOSS_LIMIT
 
-    def status_line(self) -> str:
+    def status_line(self, ledger=None) -> str:
+        if ledger:
+            return (
+                f"REAL P&L: ${ledger.net_pnl:+.2f} | "
+                f"RT: {self.mm_pnl.wins}W +${self.mm_pnl.total_pnl:.2f} | "
+                f"1-sided: {ledger.one_sided_wins}W/{ledger.one_sided_losses}L "
+                f"${ledger.one_sided_pnl:+.2f} | "
+                f"Pending: {len(ledger.positions)} | "
+                f"Rebates: ~${self.estimated_rebates:.2f}"
+            )
         return (
             f"Bankroll: ${self.total_balance:.2f} | P&L: ${self.total_pnl:+.2f} | "
             f"Hedge: {self.hedge_pnl.summary()} | "
             f"MM: {self.mm_pnl.summary()} | "
-            f"Late: {self.late_pnl.summary()} | "
             f"Rebates: ~${self.estimated_rebates:.2f}"
+        )
+
+
+@dataclass
+class TrackedPosition:
+    """A single fill that hasn't resolved yet."""
+    coin: str
+    token_id: str
+    side: str  # "up" or "down"
+    size: float
+    cost: float
+    placed_at: float
+    window_end: int
+    is_round_trip: bool = False  # True if part of a completed round-trip
+
+
+class PositionLedger:
+    """Tracks ALL fills and their resolutions — the source of truth for P&L."""
+
+    def __init__(self):
+        self.positions: list[TrackedPosition] = []
+        self.round_trip_pnl: float = 0.0
+        self.round_trip_count: int = 0
+        self.one_sided_wins: int = 0
+        self.one_sided_losses: int = 0
+        self.one_sided_pnl: float = 0.0
+
+    @property
+    def net_pnl(self) -> float:
+        return self.round_trip_pnl + self.one_sided_pnl
+
+    @property
+    def total_deployed(self) -> float:
+        return sum(p.cost for p in self.positions)
+
+    def add_fill(self, coin: str, token_id: str, side: str, size: float,
+                 cost: float, window_end: int):
+        """Record a new fill."""
+        self.positions.append(TrackedPosition(
+            coin=coin, token_id=token_id, side=side, size=size,
+            cost=cost, placed_at=time.time(), window_end=window_end,
+        ))
+
+    def record_round_trip(self, profit: float):
+        """Record a completed round-trip (both sides filled)."""
+        self.round_trip_pnl += profit
+        self.round_trip_count += 1
+
+    def check_resolutions(self):
+        """Check if any positions have resolved. Uses Polymarket midpoint API."""
+        import requests
+        resolved = []
+        for pos in self.positions:
+            if pos.is_round_trip:
+                continue
+            # Only check if window should have closed (give 30s buffer)
+            if time.time() < pos.window_end + 30:
+                continue
+            try:
+                resp = requests.get(
+                    "https://clob.polymarket.com/midpoint",
+                    params={"token_id": pos.token_id},
+                    timeout=5,
+                )
+                data = resp.json()
+                price = float(data.get("mid", 0.5))
+
+                if price >= 0.90:
+                    # WIN — position resolved in our favor
+                    profit = round(pos.size * 1.0 - pos.cost, 2)
+                    self.one_sided_wins += 1
+                    self.one_sided_pnl += profit
+                    msg = f"✅ 1-SIDED WIN: {pos.coin} {pos.side.upper()} +${profit:.2f}"
+                    console.print(f"  [bold green]{msg}[/bold green]")
+                    _send_tg(msg)
+                    resolved.append(pos)
+                elif price <= 0.10:
+                    # LOSS — position resolved against us
+                    self.one_sided_losses += 1
+                    self.one_sided_pnl -= pos.cost
+                    msg = f"❌ 1-SIDED LOSS: {pos.coin} {pos.side.upper()} -${pos.cost:.2f}"
+                    console.print(f"  [red]{msg}[/red]")
+                    _send_tg(msg)
+                    resolved.append(pos)
+                # else: not resolved yet, keep tracking
+            except Exception:
+                pass  # API error, try again next cycle
+
+        # Remove resolved positions
+        for pos in resolved:
+            if pos in self.positions:
+                self.positions.remove(pos)
+
+        # Clean up very old positions (> 1 hour) — assume lost
+        cutoff = time.time() - 3600
+        stale = [p for p in self.positions if p.placed_at < cutoff and not p.is_round_trip]
+        for pos in stale:
+            self.one_sided_losses += 1
+            self.one_sided_pnl -= pos.cost
+            msg = f"⏰ STALE LOSS: {pos.coin} {pos.side.upper()} -${pos.cost:.2f} (timed out)"
+            console.print(f"  [red]{msg}[/red]")
+            _send_tg(msg)
+            self.positions.remove(pos)
+
+    def summary(self) -> str:
+        return (
+            f"REAL P&L: ${self.net_pnl:+.2f} | "
+            f"RT: {self.round_trip_count} (+${self.round_trip_pnl:.2f}) | "
+            f"1-sided: {self.one_sided_wins}W/{self.one_sided_losses}L "
+            f"(${self.one_sided_pnl:+.2f}) | "
+            f"Open: {len(self.positions)}"
         )
 
 
@@ -354,7 +473,7 @@ class MMState:
         return self.inventory_up - self.inventory_down
 
 
-async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll, is_paper: bool):
+async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll, is_paper: bool, ledger: PositionLedger = None):
     """Manage market making quotes for a coin."""
     mid = get_midpoint(client, market.up_token_id)
     if mid is None or mid <= 0.05 or mid >= 0.95:
@@ -429,7 +548,8 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
                 bankroll.mm_pnl.total_volume += V6_MM_SIZE * 2
                 bankroll.estimated_rebates += V6_MM_SIZE * 2 * 0.01
 
-                msg = f"📊 {ptag}MM ROUND-TRIP: {market.coin} +${spread_profit:.2f} spread"
+                _tf = "5m" if "5m" in market.slug else "15m" if "15m" in market.slug else "1h"
+                msg = f"📊 {ptag}MM ROUND-TRIP: {market.coin}/{_tf} +${spread_profit:.2f} spread"
                 console.print(f"  [bold cyan]{msg}[/bold cyan]")
                 _send_tg(msg)
 
@@ -524,7 +644,11 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
                 if buy_matched > 0:
                     mm_state.buy_filled = True
                     mm_state.inventory_up += buy_matched
-                    console.print(f"  [cyan]📊 MM BUY FILL: {market.coin} UP @ ${mm_state.buy_price:.2f} ({buy_matched:.1f} shares)[/cyan]")
+                    buy_cost = round(mm_state.buy_price * buy_matched, 2)
+                    if ledger:
+                        ledger.add_fill(market.coin, market.up_token_id, "up", buy_matched, buy_cost, market.end_timestamp if hasattr(market, 'end_timestamp') else int(time.time()) + 900)
+                    _tf = "5m" if "5m" in market.slug else "15m" if "15m" in market.slug else "1h"
+                    console.print(f"  [cyan]📊 MM BUY FILL: {market.coin}/{_tf} UP @ ${mm_state.buy_price:.2f} ({buy_matched:.1f} shares, ${buy_cost:.2f})[/cyan]")
                 else:
                     client.cancel(mm_state.buy_order_id)
             except Exception:
@@ -539,7 +663,11 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
                     mm_state.sell_filled = True
                     mm_state.inventory_down += sell_matched
                     down_price = round(1.0 - mm_state.sell_price, 2)
-                    console.print(f"  [cyan]📊 MM SELL FILL: {market.coin} DOWN @ ${down_price:.2f} ({sell_matched:.1f} shares)[/cyan]")
+                    sell_cost = round(down_price * sell_matched, 2)
+                    if ledger:
+                        ledger.add_fill(market.coin, market.down_token_id, "down", sell_matched, sell_cost, market.end_timestamp if hasattr(market, 'end_timestamp') else int(time.time()) + 900)
+                    _tf = "5m" if "5m" in market.slug else "15m" if "15m" in market.slug else "1h"
+                    console.print(f"  [cyan]📊 MM SELL FILL: {market.coin}/{_tf} DOWN @ ${down_price:.2f} ({sell_matched:.1f} shares, ${sell_cost:.2f})[/cyan]")
                 else:
                     client.cancel(mm_state.sell_order_id)
             except Exception:
@@ -553,9 +681,16 @@ async def manage_mm_quotes(client, market, mm_state: MMState, bankroll: Bankroll
             bankroll.mm_pool += spread_profit
             bankroll.mm_pnl.wins += 1
             bankroll.mm_pnl.total_pnl += spread_profit
+            if ledger:
+                ledger.record_round_trip(spread_profit)
+                # Remove these from the ledger (they're resolved as round-trips)
+                ledger.positions = [p for p in ledger.positions
+                                    if not (p.coin == market.coin and not p.is_round_trip
+                                            and time.time() - p.placed_at < 120)]
             bankroll.mm_pnl.trades += 1
             bankroll.estimated_rebates += V6_MM_SIZE * 2 * 0.01
-            msg = f"📊 MM ROUND-TRIP: {market.coin} +${spread_profit:.2f} spread"
+            _tf = "5m" if "5m" in market.slug else "15m" if "15m" in market.slug else "1h"
+            msg = f"📊 MM ROUND-TRIP: {market.coin}/{_tf} +${spread_profit:.2f} spread"
             console.print(f"  [bold cyan]{msg}[/bold cyan]")
             _send_tg(msg)
             mm_state.buy_filled = False
@@ -1086,6 +1221,7 @@ async def run_v6_engine():
 
     # ── Init state ──
     bankroll = Bankroll(starting=V6_BANKROLL)
+    ledger = PositionLedger()
     windows: dict[str, WindowState] = {}
     prev_windows: dict[str, WindowState] = {}
     mm_states: dict[str, MMState] = {}
@@ -1182,7 +1318,7 @@ async def run_v6_engine():
                     if market_key not in mm_states:
                         mm_states[market_key] = MMState(coin=coin)
                     try:
-                        await manage_mm_quotes(client, market, mm_states[market_key], bankroll, PAPER_TRADE)
+                        await manage_mm_quotes(client, market, mm_states[market_key], bankroll, PAPER_TRADE, ledger)
                     except Exception as e:
                         console.print(f"  [dim]MM quote failed: {e}[/dim]")
 
@@ -1197,11 +1333,16 @@ async def run_v6_engine():
             # ── Status every 60 seconds ──
             status_counter += 1
             if status_counter >= int(60 / V6_HEDGE_POLL_INTERVAL):
-                console.print(f"  {bankroll.status_line()}")
+                console.print(f"  {bankroll.status_line(ledger)}")
                 status_counter = 0
 
-            # ── Auto-claim every 60 seconds (use dedicated timer) ──
+            # ── Check resolutions every 30 seconds ──
             current_time = int(time.time())
+            if (current_time - getattr(ledger, '_last_check', 0)) >= 30:
+                ledger._last_check = current_time
+                ledger.check_resolutions()
+
+            # ── Auto-claim every 60 seconds (use dedicated timer) ──
             if not PAPER_TRADE and (current_time - getattr(bankroll, '_last_claim', 0)) >= 60:
                 bankroll._last_claim = current_time
                 await auto_claim_resolved(client, bankroll)
@@ -1211,7 +1352,7 @@ async def run_v6_engine():
                 bankroll._last_tg = current_time
                 _send_tg(
                     f"📈 V6 Status\n"
-                    f"{bankroll.status_line()}\n"
+                    f"{ledger.summary()}\n"
                     f"Markets: {len(V6_COINS)} coins × {len(V6_TIMEFRAMES)} timeframes\n"
                     f"WS: {orderbook_feed.stats}"
                 )
