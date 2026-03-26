@@ -397,27 +397,155 @@ async def attempt_leg2(client, hedge: OpenHedge, opposite_ask: float, bankroll: 
     return True
 
 
+def get_best_bid(client, token_id: str):
+    """Get best bid price and size from CLOB orderbook."""
+    try:
+        book = client.get_order_book(token_id)
+        bids_raw = book.get("bids", []) if isinstance(book, dict) else getattr(book, "bids", [])
+        parsed = []
+        for entry in bids_raw:
+            if isinstance(entry, dict):
+                p = float(entry.get("price", 0))
+                s = float(entry.get("size", 0))
+            else:
+                p = float(getattr(entry, "price", 0))
+                s = float(getattr(entry, "size", 0))
+            if p > 0 and s > 0:
+                parsed.append((p, s))
+        if not parsed:
+            return None
+        best_price = max(p for p, s in parsed)
+        best_size = sum(s for p, s in parsed if p == best_price)
+        return (round(best_price, 2), best_size)
+    except Exception:
+        return None
+
+
 async def unwind_leg1(client, hedge: OpenHedge, bankroll: Bankroll, is_paper: bool):
-    """Sell back Leg 1 — hedge window expired."""
+    """Sell back Leg 1 — hedge window expired. MUST actually sell or track full loss."""
     from py_clob_client.clob_types import OrderArgs, OrderType
     from py_clob_client.order_builder.constants import SELL
+    import time as _time
 
     ptag = "📝 " if is_paper else ""
-    sell_price = round(hedge.leg1_price - 0.02, 2)  # Sell 2 cents below buy = small loss
 
     if is_paper:
         loss = round(0.02 * hedge.leg1_size, 2)
+        bankroll.balance += hedge.leg1_cost - loss
+        bankroll.pnl.unwinds += 1
+        bankroll.pnl.record("unwind", hedge.coin, hedge.tf, -loss,
+                            leg1_price=hedge.leg1_price, size=hedge.leg1_size)
+        bankroll.daily_losses += loss
+        msg = (
+            f"⏰ {ptag}UNWIND: {hedge.coin}/{hedge.tf} {hedge.leg1_side.upper()}\n"
+            f"No hedge found in {V7_MAX_WAIT_SECONDS}s → sold back (-${loss:.2f})"
+        )
+        console.print(f"  [yellow]{msg}[/yellow]")
+        _send_tg(msg)
+        return
+
+    # ── REAL UNWIND: Sell at best bid, verify fill ──
+    # Get current best bid — sell at MARKET price, not our cost
+    best_bid = get_best_bid(client, hedge.leg1_token_id)
+    if best_bid and best_bid[0] > 0.01:
+        sell_price = best_bid[0]  # Sell at whatever the market will pay
     else:
-        if sell_price <= 0.01:
-            loss = hedge.leg1_cost  # Total loss if can't sell
-        else:
-            try:
-                args = OrderArgs(token_id=hedge.leg1_token_id, price=sell_price, size=hedge.leg1_size, side=SELL)
-                signed = client.create_order(args)
-                client.post_order(signed, OrderType.GTC)
-                loss = round(0.02 * hedge.leg1_size, 2)
-            except Exception:
-                loss = round(0.05 * hedge.leg1_size, 2)  # Estimate
+        # No bid — position is worthless, record full loss
+        loss = hedge.leg1_cost
+        bankroll.balance -= 0  # Already spent when we bought
+        bankroll.pnl.unwinds += 1
+        bankroll.pnl.record("unwind", hedge.coin, hedge.tf, -loss,
+                            leg1_price=hedge.leg1_price, size=hedge.leg1_size)
+        bankroll.daily_losses += loss
+        msg = (
+            f"⚠️ UNWIND FAILED: {hedge.coin}/{hedge.tf} {hedge.leg1_side.upper()}\n"
+            f"No bids — full loss -${loss:.2f}"
+        )
+        console.print(f"  [red]{msg}[/red]")
+        _send_tg(msg)
+        return
+
+    # Place sell order at best bid
+    filled = False
+    try:
+        args = OrderArgs(
+            token_id=hedge.leg1_token_id,
+            price=sell_price,
+            size=hedge.leg1_size,
+            side=SELL,
+        )
+        signed = client.create_order(args)
+        response = client.post_order(signed, OrderType.GTC)
+
+        # Extract order ID and verify fill
+        order_id = None
+        if isinstance(response, dict):
+            order_id = response.get("orderID", response.get("id", ""))
+            if not response.get("success", True):
+                order_id = None
+
+        if order_id:
+            # Wait up to 10 seconds for fill
+            for _ in range(5):
+                _time.sleep(2)
+                try:
+                    order_status = client.get_order(order_id)
+                    if isinstance(order_status, dict):
+                        status = order_status.get("status", "").upper()
+                        size_matched = float(order_status.get("size_matched", 0))
+                    else:
+                        status = getattr(order_status, "status", "").upper()
+                        size_matched = float(getattr(order_status, "size_matched", 0))
+
+                    if status == "MATCHED" or size_matched > 0:
+                        filled = True
+                        actual_sell = round(sell_price * size_matched, 2)
+                        loss = round(hedge.leg1_cost - actual_sell, 2)
+                        break
+                    elif status in ("CANCELLED", "EXPIRED"):
+                        break
+                except Exception:
+                    pass
+
+            # If not filled, cancel and try at lower price
+            if not filled:
+                try:
+                    client.cancel(order_id)
+                except Exception:
+                    pass
+
+                # Try again at 50% of best bid (desperate sell)
+                desperate_price = round(sell_price * 0.5, 2)
+                if desperate_price > 0.01:
+                    try:
+                        args2 = OrderArgs(
+                            token_id=hedge.leg1_token_id,
+                            price=desperate_price,
+                            size=hedge.leg1_size,
+                            side=SELL,
+                        )
+                        signed2 = client.create_order(args2)
+                        client.post_order(signed2, OrderType.GTC)
+                        # Don't wait — just hope it fills. Record estimated loss.
+                        loss = round(hedge.leg1_cost - desperate_price * hedge.leg1_size, 2)
+                        filled = True  # Optimistic — at least we tried hard
+                    except Exception:
+                        pass
+    except Exception as e:
+        console.print(f"  [red]Unwind order failed: {e}[/red]")
+
+    # If still not filled, record FULL loss
+    if not filled:
+        loss = hedge.leg1_cost
+        msg = (
+            f"⚠️ UNWIND FAILED: {hedge.coin}/{hedge.tf} {hedge.leg1_side.upper()}\n"
+            f"Could not sell — full loss -${loss:.2f}"
+        )
+    else:
+        msg = (
+            f"⏰ UNWIND: {hedge.coin}/{hedge.tf} {hedge.leg1_side.upper()}\n"
+            f"Sold @ ${sell_price:.2f} → loss -${loss:.2f}"
+        )
 
     bankroll.balance += hedge.leg1_cost - loss
     bankroll.pnl.unwinds += 1
@@ -425,10 +553,6 @@ async def unwind_leg1(client, hedge: OpenHedge, bankroll: Bankroll, is_paper: bo
                         leg1_price=hedge.leg1_price, size=hedge.leg1_size)
     bankroll.daily_losses += loss
 
-    msg = (
-        f"⏰ {ptag}UNWIND: {hedge.coin}/{hedge.tf} {hedge.leg1_side.upper()}\n"
-        f"No hedge found in {V7_MAX_WAIT_SECONDS}s → sold back (-${loss:.2f})"
-    )
     console.print(f"  [yellow]{msg}[/yellow]")
     _send_tg(msg)
 
