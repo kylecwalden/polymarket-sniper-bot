@@ -77,6 +77,7 @@ class PnLTracker:
     wins: int = 0
     losses: int = 0
     unwinds: int = 0
+    failed_unwinds: int = 0
     total_pnl: float = 0.0
     trades: int = 0
     history: list = field(default_factory=list)
@@ -162,18 +163,21 @@ class Bankroll:
 
     def full_report(self) -> str:
         """Detailed P&L report for Telegram."""
+        failed = getattr(self.pnl, 'failed_unwinds', 0)
         lines = [
             f"📊 V7 P&L Report",
             f"Total: ${self.pnl.total_pnl:+.2f} | Cash: ${self.balance:.2f}",
             f"Record: {self.pnl.summary()}",
-            f"",
         ]
+        if failed > 0:
+            lines.append(f"⚠️ Failed unwinds: {failed}")
+        lines.append(f"")
         # Per coin
         for coin in sorted(self.pnl.coin_pnl.keys()):
             c = self.pnl.coin_pnl[coin]
             lines.append(f"{coin}: {c['wins']}W/{c['unwinds']}U ${c['pnl']:+.2f}")
         # Per timeframe
-        tf_parts = [f"{tf}: ${self.pnl.tf_pnl[tf]:+.2f}" for tf in ["5m", "15m", "1h"] if self.pnl.tf_pnl.get(tf, 0) != 0]
+        tf_parts = [f"{tf}: ${self.pnl.tf_pnl[tf]:+.2f}" for tf in ["5m", "15m"] if self.pnl.tf_pnl.get(tf, 0) != 0]
         if tf_parts:
             lines.append(f"")
             lines.append(" | ".join(tf_parts))
@@ -457,6 +461,7 @@ async def unwind_leg1(client, hedge: OpenHedge, bankroll: Bankroll, is_paper: bo
         bankroll.pnl.record("unwind", hedge.coin, hedge.tf, -loss,
                             leg1_price=hedge.leg1_price, size=hedge.leg1_size)
         bankroll.daily_losses += loss
+        bankroll.pnl.failed_unwinds += 1
         msg = (
             f"⚠️ UNWIND FAILED: {hedge.coin}/{hedge.tf} {hedge.leg1_side.upper()}\n"
             f"No bids — full loss -${loss:.2f}"
@@ -537,6 +542,7 @@ async def unwind_leg1(client, hedge: OpenHedge, bankroll: Bankroll, is_paper: bo
     # If still not filled, record FULL loss
     if not filled:
         loss = hedge.leg1_cost
+        bankroll.pnl.failed_unwinds += 1
         msg = (
             f"⚠️ UNWIND FAILED: {hedge.coin}/{hedge.tf} {hedge.leg1_side.upper()}\n"
             f"Could not sell — full loss -${loss:.2f}"
