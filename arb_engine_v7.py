@@ -257,7 +257,7 @@ def check_for_dump(tracker: WindowTracker, up_ask: float, down_ask: float) -> Op
     # Check for UP dump (UP price dropped significantly from high)
     if tracker.up_high > 0.10:
         up_drop = (tracker.up_high - up_ask) / tracker.up_high
-        if up_drop >= V7_DUMP_THRESHOLD and up_ask > 0.05:
+        if up_drop >= V7_DUMP_THRESHOLD and up_ask >= 0.35:
             return {
                 "dumped_side": "up",
                 "current_ask": up_ask,
@@ -269,7 +269,7 @@ def check_for_dump(tracker: WindowTracker, up_ask: float, down_ask: float) -> Op
     # Check for DOWN dump
     if tracker.down_high > 0.10:
         down_drop = (tracker.down_high - down_ask) / tracker.down_high
-        if down_drop >= V7_DUMP_THRESHOLD and down_ask > 0.05:
+        if down_drop >= V7_DUMP_THRESHOLD and down_ask >= 0.35:
             return {
                 "dumped_side": "down",
                 "current_ask": down_ask,
