@@ -233,6 +233,12 @@ def cmd_v7():
     v7_main()
 
 
+def cmd_bonds():
+    """Run bond grinder — near-certainty yield strategy."""
+    from bond_grinder import main as bonds_main
+    bonds_main()
+
+
 def cmd_positions():
     """Show current positions and P&L."""
     show_positions()
@@ -255,6 +261,7 @@ def main():
         "v6": cmd_v6,
         "weather2": cmd_weather2,
         "v7": cmd_v7,
+        "bonds": cmd_bonds,
     }
 
     if cmd in commands:
