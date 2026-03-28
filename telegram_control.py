@@ -153,7 +153,7 @@ def tool_bot_status() -> str:
         except Exception:
             lines.append(f"⚪ {label}: Unknown")
 
-    # Separate scoreboards for each bot
+    # Separate scoreboards for each bot service
     for service, header in [("polymarket-bot", "🌤️ WEATHER SCOREBOARD"), ("crypto-maker", "📈 CRYPTO SCOREBOARD")]:
         try:
             log_result = subprocess.run(
@@ -186,6 +186,70 @@ def tool_bot_status() -> str:
         except Exception:
             lines.append(f"\n{header}")
             lines.append("  Could not read logs")
+
+    # Bond Grinder scoreboard (from data file)
+    lines.append("\n🏦 BOND GRINDER SCOREBOARD")
+    try:
+        import json as _json
+        pnl_file = BOT_DIR / "data" / "bond_pnl.json"
+        if pnl_file.exists():
+            bp = _json.loads(pnl_file.read_text())
+            net = bp.get("total_returned", 0) - bp.get("total_invested", 0)
+            wr = bp["wins"] / (bp["wins"] + bp["losses"]) * 100 if (bp["wins"] + bp["losses"]) > 0 else 0
+            lines.append(f"  📊 P&L: ${net:+.2f}")
+            lines.append(f"  🎯 W/L: {bp['wins']}/{bp['losses']} ({wr:.0f}%)")
+            lines.append(f"  ⏳ Open: {bp.get('positions_open', 0)}")
+        else:
+            lines.append("  No data yet")
+    except Exception:
+        lines.append("  Could not read data")
+
+    # AI Mispricing scoreboard (from data file)
+    lines.append("\n🔍 AI MISPRICING SCOREBOARD")
+    try:
+        import json as _json
+        trades_file = BOT_DIR / "data" / "ai_mispricing_trades.json"
+        if trades_file.exists():
+            trades = _json.loads(trades_file.read_text())
+            total_invested = sum(t.get("bet_size", 0) for t in trades if t.get("status") in ("placed", "paper_placed"))
+            wins = sum(1 for t in trades if t.get("resolved") and t.get("won"))
+            losses = sum(1 for t in trades if t.get("resolved") and not t.get("won"))
+            open_pos = sum(1 for t in trades if t.get("status") in ("placed", "paper_placed") and not t.get("resolved"))
+            total_returned = sum(t.get("payout", 0) for t in trades if t.get("resolved") and t.get("won"))
+            net = total_returned - total_invested
+            lines.append(f"  📊 P&L: ${net:+.2f}")
+            lines.append(f"  🎯 W/L: {wins}/{losses}")
+            lines.append(f"  ⏳ Open: {open_pos}")
+            lines.append(f"  💰 Deployed: ${total_invested:.2f}")
+        else:
+            lines.append("  No data yet")
+    except Exception:
+        lines.append("  Could not read data")
+
+    # V7 Dump-and-Hedge scoreboard (from logs)
+    lines.append("\n⚡ V7 DUMP-AND-HEDGE")
+    try:
+        v7_result = subprocess.run(
+            ["sudo", "journalctl", "-u", "polymarket-v7", "--no-pager", "-n", "20"],
+            capture_output=True, text=True, timeout=5
+        )
+        v7_active = subprocess.run(
+            ["sudo", "systemctl", "is-active", "polymarket-v7"],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip() == "active"
+
+        if v7_active:
+            lines.append("  🟢 Running")
+            v7_lines = v7_result.stdout.strip().split("\n")
+            for vl in reversed(v7_lines):
+                if "P&L" in vl or "pnl" in vl.lower():
+                    info = vl.split("]: ", 1)[-1] if "]: " in vl else vl
+                    lines.append(f"  📊 {info.strip()[:80]}")
+                    break
+        else:
+            lines.append("  🔴 Stopped")
+    except Exception:
+        lines.append("  Status unknown")
 
     return "\n".join(lines) if lines else "Could not get status"
 
@@ -528,16 +592,98 @@ def handle_quick_command(command: str) -> str | None:
             "`/restart` — Restart the bot\n"
             "`/pause` — Stop trading\n"
             "`/resume` — Resume trading\n"
+            "`/pnl` — All strategy P&L\n"
+            "`approve 1` — Approve AI mispricing trade #1\n"
+            "`approve all` — Approve all pending AI trades\n"
             "`/help` — This message\n\n"
             "*Or ask me anything:*\n"
             "\"why aren't we getting fills?\"\n"
-            "\"change edge threshold to 12%\"\n"
-            "\"show today's P&L\"\n"
-            "\"what's the ensemble forecast for Dallas?\"\n\n"
+            "\"show today's P&L\"\n\n"
             "I can read code, edit files, check logs, and restart the bot."
         )
+    elif cmd == "/pnl":
+        return _get_master_pnl()
+
+    # Handle "approve N" or "approve all" for AI mispricing
+    if cmd.startswith("approve "):
+        return _handle_approve(command.strip())
 
     return None  # Not a quick command — use Claude
+
+
+def _get_master_pnl() -> str:
+    """Master P&L across all strategies."""
+    import json as _json
+    lines = ["📊 *MASTER P&L*\n"]
+
+    # Bond Grinder
+    try:
+        pnl_file = BOT_DIR / "data" / "bond_pnl.json"
+        if pnl_file.exists():
+            bp = _json.loads(pnl_file.read_text())
+            net = bp.get("total_returned", 0) - bp.get("total_invested", 0)
+            lines.append(f"🏦 Bonds: ${net:+.2f} ({bp['wins']}W/{bp['losses']}L)")
+        else:
+            lines.append("🏦 Bonds: No data")
+    except Exception:
+        lines.append("🏦 Bonds: Error")
+
+    # AI Mispricing
+    try:
+        trades_file = BOT_DIR / "data" / "ai_mispricing_trades.json"
+        if trades_file.exists():
+            trades = _json.loads(trades_file.read_text())
+            invested = sum(t.get("bet_size", 0) for t in trades if t.get("status") in ("placed", "paper_placed"))
+            returned = sum(t.get("payout", 0) for t in trades if t.get("resolved") and t.get("won"))
+            wins = sum(1 for t in trades if t.get("resolved") and t.get("won"))
+            losses = sum(1 for t in trades if t.get("resolved") and not t.get("won"))
+            open_p = sum(1 for t in trades if not t.get("resolved") and t.get("status") in ("placed", "paper_placed"))
+            lines.append(f"🔍 AI Mispricing: ${returned - invested:+.2f} ({wins}W/{losses}L, {open_p} open)")
+        else:
+            lines.append("🔍 AI Mispricing: No data")
+    except Exception:
+        lines.append("🔍 AI Mispricing: Error")
+
+    # V7
+    try:
+        v7_active = subprocess.run(
+            ["sudo", "systemctl", "is-active", "polymarket-v7"],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip() == "active"
+        lines.append(f"⚡ V7: {'Running' if v7_active else 'Stopped'}")
+    except Exception:
+        lines.append("⚡ V7: Unknown")
+
+    return "\n".join(lines)
+
+
+def _handle_approve(text: str) -> str:
+    """Handle approve commands for AI mispricing trades."""
+    import json as _json
+    import sys
+
+    parts = text.split()
+    if len(parts) < 2:
+        return "Usage: `approve 1` or `approve all`"
+
+    try:
+        # Import and run the approve function
+        sys.path.insert(0, str(BOT_DIR))
+        from ai_mispricing_scanner import approve_and_place, load_pending
+
+        if parts[1].lower() == "all":
+            pending = load_pending()
+            unapproved = [p for p in pending if not p.get("approved")]
+            if not unapproved:
+                return "No pending trades to approve."
+            approve_and_place(approve_all=True)
+            return f"✅ Approved {len(unapproved)} AI mispricing trades!"
+        else:
+            indices = [int(x) for x in parts[1:]]
+            approve_and_place(indices=indices)
+            return f"✅ Approved trades: {indices}"
+    except Exception as e:
+        return f"Error approving: {e}"
 
 
 # ── Main polling loop ──

@@ -38,7 +38,7 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 # Configuration
 # ══════════════════════════════════════════════════════════════════════
 
-BOND_BUDGET = float(os.getenv("BOND_BUDGET", "5.0"))          # Daily budget
+BOND_BUDGET = float(os.getenv("BOND_BUDGET", "0"))             # Daily budget (0 = unlimited)
 BOND_BET_SIZE = float(os.getenv("BOND_BET_SIZE", "2.0"))      # Per position
 BOND_MIN_PRICE = float(os.getenv("BOND_MIN_PRICE", "0.95"))   # Only 95+ cents
 BOND_MAX_PRICE = float(os.getenv("BOND_MAX_PRICE", "0.993"))  # Leave room for fees
@@ -350,7 +350,8 @@ async def run_bond_grinder():
     console.print("=" * 60)
     console.print("  [bold]Bond Grinder — Near-Certainty Yield Strategy[/bold]")
     console.print("=" * 60)
-    console.print(f"  Budget:        ${BOND_BUDGET}/day")
+    budget_str = "unlimited" if BOND_BUDGET <= 0 else f"${BOND_BUDGET}/day"
+    console.print(f"  Budget:        {budget_str}")
     console.print(f"  Bet size:      ${BOND_BET_SIZE}")
     console.print(f"  Price range:   ${BOND_MIN_PRICE}-${BOND_MAX_PRICE}")
     console.print(f"  Resolution:    {BOND_MIN_HOURS}h - {BOND_MAX_DAYS}d")
@@ -401,11 +402,15 @@ async def run_bond_grinder():
 
     try:
         while True:
-            remaining = max(0, BOND_BUDGET - get_daily_spend())
-            if remaining < BOND_BET_SIZE:
-                console.print(f"[dim]Budget exhausted (${remaining:.2f} left). Waiting for reset...[/dim]")
-                await asyncio.sleep(60)
-                continue
+            # Budget check (0 = unlimited)
+            if BOND_BUDGET > 0:
+                remaining = max(0, BOND_BUDGET - get_daily_spend())
+                if remaining < BOND_BET_SIZE:
+                    console.print(f"[dim]Budget exhausted (${remaining:.2f} left). Waiting for reset...[/dim]")
+                    await asyncio.sleep(60)
+                    continue
+            else:
+                remaining = float("inf")
 
             # Scan
             opps = scan_bond_opportunities()
@@ -418,9 +423,10 @@ async def run_bond_grinder():
 
             placed = 0
             for opp in new_opps:
-                remaining = max(0, BOND_BUDGET - get_daily_spend())
-                if remaining < BOND_BET_SIZE:
-                    break
+                if BOND_BUDGET > 0:
+                    remaining = max(0, BOND_BUDGET - get_daily_spend())
+                    if remaining < BOND_BET_SIZE:
+                        break
 
                 # Allium check
                 if not allium_check(opp):
@@ -524,9 +530,10 @@ async def run_bond_grinder():
                         console.print(f"  [dim]Redeem: {e}[/dim]")
 
             # Status
+            budget_info = "unlimited" if BOND_BUDGET <= 0 else f"${remaining:.2f}/${BOND_BUDGET:.2f}"
             console.print(
                 f"  {pnl.summary()} | "
-                f"Budget: ${remaining:.2f}/${BOND_BUDGET:.2f} | "
+                f"Budget: {budget_info} | "
                 f"Slots: {slots}"
             )
 

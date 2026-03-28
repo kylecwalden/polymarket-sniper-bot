@@ -239,6 +239,12 @@ def cmd_bonds():
     bonds_main()
 
 
+def cmd_aiscan():
+    """Run AI mispricing scanner — Exa deep reasoning."""
+    from ai_mispricing_scanner import main as aiscan_main
+    aiscan_main()
+
+
 def cmd_positions():
     """Show current positions and P&L."""
     show_positions()
@@ -262,6 +268,7 @@ def main():
         "weather2": cmd_weather2,
         "v7": cmd_v7,
         "bonds": cmd_bonds,
+        "aiscan": cmd_aiscan,
     }
 
     if cmd in commands:
@@ -277,6 +284,8 @@ def main():
         console.print("  python bot.py dual        # Run weather + crypto maker in parallel")
         console.print("  python bot.py v6          # V6 multi-strategy (hedge + MM + late entry)")
         console.print("  python bot.py weather2    # Weather V2 (ladder + forecast arb + whale copy)")
+        console.print("  python bot.py aiscan      # AI mispricing scan (Exa deep reasoning)")
+        console.print("  python bot.py aiscan auto # Auto-scan daily")
         console.print("  python bot.py positions   # Show positions and P&L")
 
 
