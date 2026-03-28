@@ -537,7 +537,8 @@ async def unwind_leg1(client, hedge: OpenHedge, bankroll: Bankroll, is_paper: bo
                     except Exception:
                         pass
     except Exception as e:
-        console.print(f"  [red]Unwind order failed: {e}[/red]")
+        console.print(f"  [red]Unwind order failed: {type(e).__name__}: {e}[/red]")
+        console.print(f"  [red]  token={hedge.leg1_token_id[:20]}... price={sell_price} size={hedge.leg1_size}[/red]")
 
     # If still not filled, record FULL loss
     if not filled:
