@@ -183,6 +183,24 @@ def fetch_uncertain_markets() -> list[dict]:
             break
 
         for m in markets:
+            # Skip sports markets — no edge vs Vegas-efficient pricing
+            question = (m.get("question", "") + " " + m.get("groupItemTitle", "")).lower()
+            sports_keywords = [
+                "vs.", "vs ", " ml", "spread:", "o/u ", "over/under",
+                "moneyline", "nba", "nfl", "mlb", "nhl", "ufc", "mma",
+                "ncaa", "premier league", "la liga", "serie a", "bundesliga",
+                "champions league", "copa", "world cup", "tennis", "atp", "wta",
+                "boxing", "bellator", "pfl", "wnba", "college football",
+                "college basketball", "march madness", "super bowl",
+                "stanley cup", "world series", "playoffs",
+                "lakers", "celtics", "warriors", "yankees", "dodgers",
+                "chiefs", "eagles", "cowboys", "49ers",
+                "fight night", "bantamweight", "middleweight", "welterweight",
+                "heavyweight", "lightweight", "featherweight", "flyweight",
+            ]
+            if any(kw in question for kw in sports_keywords):
+                continue
+
             # Check end date
             end_str = m.get("endDateIso") or m.get("endDate", "")
             if not end_str:
@@ -289,10 +307,9 @@ def exa_deep_reasoning(question: str, resolution_criteria: str = "") -> dict:
     )
 
     body = json.dumps({
-        "query": prompt,
+        "query": prompt[:1500],  # Cap query length
         "type": "deep-reasoning",
         "numResults": 5,
-        "useAutoprompt": True,
     }).encode("utf-8")
 
     req = urllib.request.Request(
@@ -301,20 +318,46 @@ def exa_deep_reasoning(question: str, resolution_criteria: str = "") -> dict:
         headers={
             "Content-Type": "application/json",
             "x-api-key": EXA_API_KEY,
+            "User-Agent": "polymarket-bot/1.0",
         },
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception as e:
-        console.print(f"[red]Exa API error: {e}[/red]")
-        return {"probability": None, "thesis": f"Exa error: {e}", "sources": []}
+    # Retry with backoff
+    last_err = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = json.loads(resp.read().decode())
+            break
+        except Exception as e:
+            last_err = e
+            console.print(f"[yellow]Exa attempt {attempt+1}/3: {e}[/yellow]")
+            time.sleep(5 * (attempt + 1))  # 5s, 10s, 15s backoff
+    else:
+        console.print(f"[red]Exa API failed after 3 attempts: {last_err}[/red]")
+        return {"probability": None, "thesis": f"Exa error: {last_err}", "sources": []}
 
-    # Extract the reasoning summary
-    summary = data.get("summary", "") or data.get("searchSummary", "") or ""
+    # Extract the reasoning summary — deep-reasoning uses output.content
+    output = data.get("output", {})
+    summary = ""
+    if isinstance(output, dict):
+        summary = output.get("content", "") or ""
+    if not summary:
+        summary = data.get("summary", "") or data.get("searchSummary", "") or ""
+
+    # Sources: from output.grounding citations + results
+    sources = []
+    if isinstance(output, dict):
+        for g in output.get("grounding", []):
+            for c in g.get("citations", []):
+                url = c.get("url", "")
+                if url and url not in sources:
+                    sources.append(url)
     results = data.get("results", [])
-    sources = [r.get("url", "") for r in results[:5] if r.get("url")]
+    for r in results[:5]:
+        url = r.get("url", "")
+        if url and url not in sources:
+            sources.append(url)
 
     # Parse probability from Exa's summary
     probability = _extract_probability(summary)
@@ -322,7 +365,7 @@ def exa_deep_reasoning(question: str, resolution_criteria: str = "") -> dict:
     return {
         "probability": probability,
         "thesis": summary[:500] if summary else "No analysis available",
-        "sources": sources,
+        "sources": sources[:5],
     }
 
 
@@ -331,31 +374,43 @@ def _extract_probability(text: str) -> Optional[float]:
     if not text:
         return None
 
-    # Look for patterns like "70%", "probability of 0.65", "65 percent", etc.
-    patterns = [
-        r'(\d{1,3}(?:\.\d+)?)\s*%',                    # 70%, 65.5%
-        r'probability\s*(?:of\s*)?(\d*\.\d+)',          # probability of 0.65
-        r'(\d{1,3})\s*percent',                         # 70 percent
-        r'estimate[ds]?\s*(?:at\s*)?(\d{1,3}(?:\.\d+)?)\s*%',  # estimated at 70%
-        r'likelihood\s*(?:of\s*)?(\d{1,3}(?:\.\d+)?)\s*%',     # likelihood of 70%
+    # Priority patterns — look for explicit probability statements first
+    priority_patterns = [
+        r'(\d{1,2}(?:\.\d+)?)\s*%\s*probability',           # 35% probability
+        r'probability\s*(?:of\s*)?(?:approximately\s*)?(\d{1,2}(?:\.\d+)?)\s*%',  # probability of 35%
+        r'probability[:\s]+(\d*\.\d+)',                       # probability: 0.35
+        r'estimate[ds]?\s*(?:at\s*)?(\d{1,2}(?:\.\d+)?)\s*%', # estimated at 35%
+        r'likelihood\s*(?:of\s*)?(\d{1,2}(?:\.\d+)?)\s*%',    # likelihood of 35%
+        r'(\d{1,2}(?:\.\d+)?)\s*percent\s*(?:probability|chance|likelihood)',  # 35 percent probability
     ]
 
-    probabilities = []
-    for pattern in patterns:
+    for pattern in priority_patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
         for m in matches:
             try:
                 val = float(m)
-                if val > 1 and val <= 100:
-                    probabilities.append(val / 100)
-                elif val <= 1:
-                    probabilities.append(val)
+                if val > 1 and val <= 99:
+                    return val / 100
+                elif 0 < val <= 1:
+                    return val
             except ValueError:
                 continue
 
+    # Fallback: find all percentages, filter out prices/dollar amounts
+    # Avoid matching "$100,000" or "100K" — only match standalone percentages
+    pct_matches = re.finditer(r'(?<!\$)(?<!\d[,.])\b(\d{1,2}(?:\.\d+)?)\s*%', text)
+    probabilities = []
+    for m in pct_matches:
+        try:
+            val = float(m.group(1))
+            # Only valid probability percentages (1-99%)
+            if 1 <= val <= 99:
+                probabilities.append(val / 100)
+        except ValueError:
+            continue
+
     if probabilities:
-        # Take the most commonly mentioned probability, or the last one
-        # (Exa tends to give the final answer at the end)
+        # Take the last one — Exa tends to give final answer at end
         return probabilities[-1]
 
     return None
@@ -422,15 +477,24 @@ def run_scan() -> list[MispricingOpportunity]:
     pending = load_pending()
     existing_pending_ids = {p["market_id"] for p in pending}
 
+    # Track which market_ids we've already flagged in THIS scan
+    # to prevent taking both sides of the same market
+    scanned_market_ids = set()
+
     for i, m in enumerate(markets):
         # Skip markets we already have trades or pending on
         if m["market_id"] in already_placed or m["market_id"] in existing_pending_ids:
             console.print(f"  [{i+1}/{len(markets)}] SKIP (already tracked): {m['question'][:50]}")
             continue
 
+        # LEARNING: Never take both sides of the same market
+        if m["market_id"] in scanned_market_ids:
+            console.print(f"  [{i+1}/{len(markets)}] SKIP (other side already flagged): {m['outcome']}")
+            continue
+
         console.print(f"  [{i+1}/{len(markets)}] Analyzing: {m['question'][:60]}...")
 
-        # Call Exa deep reasoning
+        # Call Exa deep reasoning — FIRST CALL
         result = exa_deep_reasoning(
             question=m["question"],
             resolution_criteria=m.get("description", "")[:500],
@@ -446,12 +510,61 @@ def run_scan() -> list[MispricingOpportunity]:
         edge = abs(ai_prob - market_price)
 
         console.print(
-            f"    Market: {market_price:.0%} | AI: {ai_prob:.0%} | "
+            f"    Call 1: Market: {market_price:.0%} | AI: {ai_prob:.0%} | "
             f"Edge: {edge:.0%} {'✅' if edge >= AI_MIN_EDGE else '❌'}"
         )
 
         if edge < AI_MIN_EDGE:
             continue
+
+        # LEARNING: Only BUY direction (AI thinks it's worth MORE than market)
+        # Can't short on Polymarket, so AVOID signals are useless
+        if ai_prob <= market_price:
+            console.print(f"    [yellow]AVOID direction (can't short) — skip[/yellow]")
+            continue
+
+        # LEARNING: Double-call verification — Exa can give wildly different
+        # answers on the same question. Run a second call and require both
+        # calls to agree within 15 points to confirm the signal.
+        console.print(f"    Verifying with second Exa call...")
+        time.sleep(3)  # Rate limit between calls
+
+        result2 = exa_deep_reasoning(
+            question=m["question"],
+            resolution_criteria=m.get("description", "")[:500],
+        )
+
+        ai_prob2 = result2["probability"]
+        if ai_prob2 is None:
+            console.print(f"    [yellow]Verification call failed — skip[/yellow]")
+            continue
+
+        # Check consistency between two calls
+        prob_diff = abs(ai_prob - ai_prob2)
+        avg_prob = (ai_prob + ai_prob2) / 2
+        avg_edge = abs(avg_prob - market_price)
+
+        console.print(
+            f"    Call 2: AI: {ai_prob2:.0%} | Diff: {prob_diff:.0%} | "
+            f"Avg: {avg_prob:.0%} | Avg Edge: {avg_edge:.0%}"
+        )
+
+        if prob_diff > 0.15:
+            console.print(f"    [red]❌ INCONSISTENT — calls disagree by {prob_diff:.0%} (>15%) — skip[/red]")
+            continue
+
+        if avg_edge < AI_MIN_EDGE:
+            console.print(f"    [yellow]Average edge {avg_edge:.0%} below threshold — skip[/yellow]")
+            continue
+
+        if avg_prob <= market_price:
+            console.print(f"    [yellow]Average says AVOID — skip[/yellow]")
+            continue
+
+        # Use averaged values for the final opportunity
+        ai_prob = avg_prob
+        edge = avg_edge
+        result["thesis"] = f"[Verified 2x: {result['probability']:.0%} & {ai_prob2:.0%}] " + result["thesis"]
 
         # Build opportunity
         opp = MispricingOpportunity(
@@ -662,32 +775,196 @@ def pnl_summary() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# Resolution Checker — Track wins/losses and alert via Telegram
+# ══════════════════════════════════════════════════════════════════════
+
+def check_resolutions():
+    """Check if any open AI mispricing trades have resolved. Update P&L + alert."""
+    trades = load_trades()
+    if not trades:
+        return
+
+    open_trades = [t for t in trades if t.get("status") in ("placed", "paper_placed") and not t.get("resolved")]
+    if not open_trades:
+        console.print("  [dim]No open AI trades to check[/dim]")
+        return
+
+    console.print(f"  Checking {len(open_trades)} open AI mispricing trades...")
+    updated = False
+
+    for t in open_trades:
+        condition_id = t.get("condition_id", "")
+        if not condition_id:
+            continue
+
+        # Check market status via Gamma API
+        try:
+            req = urllib.request.Request(
+                f"{GAMMA_API}/markets?conditionId={condition_id}",
+                headers={"User-Agent": "polymarket-bot/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                markets = json.loads(r.read())
+        except Exception as e:
+            console.print(f"    [yellow]API error checking {t.get('outcome', '?')[:30]}: {e}[/yellow]")
+            continue
+
+        if not markets:
+            continue
+
+        market = markets[0]
+
+        # STRICT resolution check — must have explicit resolved=True
+        # AND end date must have passed AND prices must be 0 or 1 (not mid-range)
+        is_resolved = False
+
+        # Check if Gamma says it's resolved (not just closed)
+        if market.get("resolved") == True:
+            is_resolved = True
+
+        # Double-check: end date must have passed
+        if is_resolved:
+            end_str = market.get("endDateIso") or market.get("endDate", "")
+            if end_str:
+                try:
+                    end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=timezone.utc)
+                    if end_dt > datetime.now(timezone.utc):
+                        is_resolved = False  # End date hasn't passed yet
+                except Exception:
+                    pass
+
+        # Triple-check: outcome prices should be 0 or 1 if truly resolved
+        outcomes = market.get("outcomes", [])
+        prices = market.get("outcomePrices", [])
+        if isinstance(outcomes, str):
+            try: outcomes = json.loads(outcomes)
+            except: outcomes = []
+        if isinstance(prices, str):
+            try: prices = json.loads(prices)
+            except: prices = []
+
+        if is_resolved and prices:
+            # All prices should be very close to 0.0 or 1.0
+            all_terminal = True
+            for p_str in prices:
+                try:
+                    p_val = float(p_str)
+                    if 0.02 < p_val < 0.98:
+                        all_terminal = False
+                        break
+                except (ValueError, TypeError):
+                    pass
+            if not all_terminal:
+                console.print(f"    [yellow]Skipping {t.get('outcome', '?')[:30]} — prices not terminal yet[/yellow]")
+                is_resolved = False
+
+        if not is_resolved:
+            continue
+
+        # Market truly resolved — figure out if we won
+        our_outcome = t.get("outcome", "")
+        won = False
+        for i, outcome_name in enumerate(outcomes):
+            if outcome_name == our_outcome and i < len(prices):
+                try:
+                    final_price = float(prices[i])
+                    # If final price is >= 0.98, it resolved YES (we won)
+                    won = final_price >= 0.98
+                except (ValueError, TypeError):
+                    pass
+                break
+
+        # Update trade record
+        t["resolved"] = True
+        t["won"] = won
+        t["resolved_at"] = datetime.now(timezone.utc).isoformat()
+
+        bet_size = t.get("bet_size", AI_BET_SIZE_MIN)
+        shares = t.get("shares", 0)
+
+        if won:
+            payout = shares  # Each winning share pays $1
+            t["payout"] = payout
+            profit = payout - bet_size
+            console.print(f"    [green]✅ WIN: {our_outcome[:40]} → +${profit:.2f}[/green]")
+            _send_tg(
+                f"🎉 *AI MISPRICING WIN!*\n\n"
+                f"{t.get('question', '')[:60]}\n"
+                f"✅ {our_outcome} resolved YES\n"
+                f"Bought @ {t.get('market_price', 0):.0%} | AI said: {t.get('ai_probability', 0):.0%}\n"
+                f"💰 Profit: +${profit:.2f} ({shares:.1f} shares × $1)\n\n"
+                f"{pnl_summary()}"
+            )
+        else:
+            t["payout"] = 0
+            console.print(f"    [red]❌ LOSS: {our_outcome[:40]} → -${bet_size:.2f}[/red]")
+            _send_tg(
+                f"❌ *AI MISPRICING LOSS*\n\n"
+                f"{t.get('question', '')[:60]}\n"
+                f"❌ {our_outcome} resolved NO\n"
+                f"Lost: -${bet_size:.2f}\n"
+                f"AI said {t.get('ai_probability', 0):.0%} but market was right\n\n"
+                f"{pnl_summary()}"
+            )
+
+        updated = True
+
+    if updated:
+        save_trades(trades)
+        console.print(f"  {pnl_summary()}")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # Auto-run loop (for systemd / cron)
 # ══════════════════════════════════════════════════════════════════════
 
+RESOLUTION_CHECK_INTERVAL = 3600  # Check resolutions every hour
+
 async def run_auto():
-    """Run scan automatically every AI_SCAN_INTERVAL hours."""
+    """Run scan automatically every AI_SCAN_INTERVAL hours, check resolutions hourly."""
     console.print("[bold]🤖 AI Mispricing Scanner — Auto Mode[/bold]")
     console.print(f"  Scan interval: {AI_SCAN_INTERVAL}h")
     console.print(f"  Min edge: {AI_MIN_EDGE:.0%}")
-    console.print(f"  Bet size: ${AI_BET_SIZE}")
+    console.print(f"  Bet size: ${AI_BET_SIZE_MIN}-${AI_BET_SIZE_MAX}")
     console.print(f"  Max markets per scan: {AI_MAX_MARKETS_PER_SCAN}")
+    console.print(f"  Resolution check: every 1h")
     console.print()
 
     _send_tg(
         f"🤖 AI Mispricing Scanner started\n"
-        f"Scanning every {AI_SCAN_INTERVAL}h | Min edge: {AI_MIN_EDGE:.0%}"
+        f"Scanning every {AI_SCAN_INTERVAL}h | Min edge: {AI_MIN_EDGE:.0%}\n"
+        f"Resolution checks: every 1h"
     )
 
-    while True:
-        try:
-            run_scan()
-        except Exception as e:
-            console.print(f"[red]Scan error: {e}[/red]")
-            _send_tg(f"❌ AI scan error: {e}")
+    last_scan = 0  # Force first scan immediately
+    last_resolution_check = 0
 
-        console.print(f"[dim]Next scan in {AI_SCAN_INTERVAL} hours...[/dim]")
-        await asyncio.sleep(AI_SCAN_INTERVAL * 3600)
+    while True:
+        now = time.time()
+
+        # Resolution check every hour
+        if now - last_resolution_check >= RESOLUTION_CHECK_INTERVAL:
+            try:
+                console.print(f"\n[bold]🔄 Resolution Check — {datetime.now(timezone.utc).strftime('%H:%M UTC')}[/bold]")
+                check_resolutions()
+                last_resolution_check = now
+            except Exception as e:
+                console.print(f"[red]Resolution check error: {e}[/red]")
+
+        # Full scan every AI_SCAN_INTERVAL hours
+        if now - last_scan >= AI_SCAN_INTERVAL * 3600:
+            try:
+                console.print(f"\n[bold]🔍 Full Scan — {datetime.now(timezone.utc).strftime('%H:%M UTC')}[/bold]")
+                run_scan()
+                last_scan = now
+            except Exception as e:
+                console.print(f"[red]Scan error: {e}[/red]")
+                _send_tg(f"❌ AI scan error: {e}")
+
+        # Sleep 5 minutes between checks
+        await asyncio.sleep(300)
 
 
 # ══════════════════════════════════════════════════════════════════════

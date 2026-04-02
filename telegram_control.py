@@ -614,19 +614,75 @@ def handle_quick_command(command: str) -> str | None:
 def _get_master_pnl() -> str:
     """Master P&L across all strategies."""
     import json as _json
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
     lines = ["📊 *MASTER P&L*\n"]
 
     # Bond Grinder
     try:
         pnl_file = BOT_DIR / "data" / "bond_pnl.json"
+        orders_file = BOT_DIR / "data" / "bond_orders.jsonl"
         if pnl_file.exists():
             bp = _json.loads(pnl_file.read_text())
             net = bp.get("total_returned", 0) - bp.get("total_invested", 0)
-            lines.append(f"🏦 Bonds: ${net:+.2f} ({bp['wins']}W/{bp['losses']}L)")
+            wr = bp["wins"] / (bp["wins"] + bp["losses"]) * 100 if (bp["wins"] + bp["losses"]) > 0 else 0
+            lines.append(f"🏦 *BONDS*: ${net:+.2f} | {bp['wins']}W/{bp['losses']}L ({wr:.0f}%) | Open: {bp.get('positions_open', 0)}")
+
+            # Show open bond positions with resolution times
+            if orders_file.exists():
+                orders = []
+                for line in orders_file.read_text().strip().split("\n"):
+                    if line.strip():
+                        try:
+                            orders.append(_json.loads(line))
+                        except Exception:
+                            pass
+
+                # Show each open position
+                if orders:
+                    lines.append("")
+                    shown = 0
+                    for o in orders[-30:]:  # Last 30 orders
+                        q = o.get("question", "?")[:40]
+                        outcome = o.get("outcome", "?")[:15]
+                        price = o.get("price", 0)
+                        amount = o.get("amount", 0)
+                        yld = o.get("yield_pct", 0)
+
+                        # Calculate time to resolution from end_date if available
+                        end_str = o.get("end_date", "")
+                        time_str = "?"
+                        if end_str:
+                            try:
+                                end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                                if end_dt.tzinfo is None:
+                                    end_dt = end_dt.replace(tzinfo=timezone.utc)
+                                hours_left = (end_dt - now).total_seconds() / 3600
+                                if hours_left <= 0:
+                                    time_str = "RESOLVED"
+                                elif hours_left < 1:
+                                    time_str = f"{hours_left*60:.0f}m"
+                                elif hours_left < 24:
+                                    time_str = f"{hours_left:.0f}h"
+                                else:
+                                    time_str = f"{hours_left/24:.1f}d"
+                            except Exception:
+                                pass
+
+                        lines.append(f"  {outcome} @ {price:.0%} | +{yld:.1%} | {time_str} | {q}")
+                        shown += 1
+                        if shown >= 20:
+                            remaining = len(orders) - shown
+                            if remaining > 0:
+                                lines.append(f"  ... +{remaining} more")
+                            break
         else:
             lines.append("🏦 Bonds: No data")
     except Exception:
         lines.append("🏦 Bonds: Error")
+
+    lines.append("")
 
     # AI Mispricing
     try:
@@ -637,12 +693,39 @@ def _get_master_pnl() -> str:
             returned = sum(t.get("payout", 0) for t in trades if t.get("resolved") and t.get("won"))
             wins = sum(1 for t in trades if t.get("resolved") and t.get("won"))
             losses = sum(1 for t in trades if t.get("resolved") and not t.get("won"))
-            open_p = sum(1 for t in trades if not t.get("resolved") and t.get("status") in ("placed", "paper_placed"))
-            lines.append(f"🔍 AI Mispricing: ${returned - invested:+.2f} ({wins}W/{losses}L, {open_p} open)")
+            open_trades = [t for t in trades if not t.get("resolved") and t.get("status") in ("placed", "paper_placed")]
+            lines.append(f"🔍 *AI MISPRICING*: ${returned - invested:+.2f} | {wins}W/{losses}L | {len(open_trades)} open")
+
+            # Show open AI mispricing positions
+            for t in open_trades:
+                q = t.get("question", "?")[:40]
+                outcome = t.get("outcome", "?")[:15]
+                buy_price = t.get("market_price", 0)
+                ai_prob = t.get("ai_probability", 0)
+                bet = t.get("bet_size", 0)
+                end_str = t.get("resolution_date", "")
+                time_str = "?"
+                if end_str:
+                    try:
+                        end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                        if end_dt.tzinfo is None:
+                            end_dt = end_dt.replace(tzinfo=timezone.utc)
+                        hours_left = (end_dt - now).total_seconds() / 3600
+                        if hours_left <= 0:
+                            time_str = "DUE"
+                        elif hours_left < 24:
+                            time_str = f"{hours_left:.0f}h"
+                        else:
+                            time_str = f"{hours_left/24:.1f}d"
+                    except Exception:
+                        pass
+                lines.append(f"  {outcome} @ {buy_price:.0%} (AI:{ai_prob:.0%}) | ${bet:.2f} | {time_str} | {q}")
         else:
             lines.append("🔍 AI Mispricing: No data")
     except Exception:
         lines.append("🔍 AI Mispricing: Error")
+
+    lines.append("")
 
     # V7
     try:

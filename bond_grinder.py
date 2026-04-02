@@ -265,6 +265,27 @@ def scan_bond_opportunities() -> list[BondOpportunity]:
                 try: token_ids = json.loads(token_ids)
                 except: token_ids = []
 
+            # Skip sports markets — no edge vs Vegas
+            q_lower = m.get("question", "").lower()
+            SPORTS_KEYWORDS = [
+                "nba", "nfl", "mlb", "nhl", "ncaa", "cbb", "cfb",
+                "ufc", "mma", "boxing", "wrestling",
+                "spread:", "moneyline", "o/u ",
+                "vs.", "lakers", "celtics", "knicks", "bulls", "warriors",
+                "yankees", "dodgers", "chiefs", "cowboys", "eagles",
+                "premier league", "la liga", "serie a", "bundesliga",
+                "champions league", "europa league",
+                "atp", "wta", "tennis",
+                "kings vs", "raptors", "suns", "jazz",
+                "wildcats", "boilermakers", "bulldogs", "tigers",
+                "lol:", "counter-strike", "cs2", "dota", "valorant",
+                "esports", "bo3", "bo5",
+                "soccer", "football", "fútbol",
+                "win on 2026", "win on 2027",  # generic sports match
+            ]
+            if any(kw in q_lower for kw in SPORTS_KEYWORDS):
+                continue
+
             for i, outcome in enumerate(outcomes):
                 if i >= len(prices) or i >= len(token_ids):
                     continue
@@ -379,7 +400,7 @@ async def run_bond_grinder():
             from poly_web3 import PolyWeb3Service, RELAYER_URL
             from py_builder_signing_sdk.config import BuilderConfig
             from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
-            from py_builder_relayer_client import RelayerClient
+            from py_builder_relayer_client.client import RelayClient as RelayerClient
 
             builder_config = BuilderConfig(
                 local_builder_creds=BuilderApiKeyCreds(
@@ -388,7 +409,7 @@ async def run_bond_grinder():
                     passphrase=os.getenv("POLY_BUILDER_PASSPHRASE", ""),
                 )
             )
-            relayer_client = RelayerClient(RELAYER_URL, builder_config)
+            relayer_client = RelayerClient(RELAYER_URL, 137, private_key, builder_config)
             redeem_service = PolyWeb3Service(
                 clob_client=client,
                 relayer_client=relayer_client,
@@ -398,7 +419,8 @@ async def run_bond_grinder():
         except Exception as e:
             console.print(f"  [yellow]Auto-redeem unavailable: {e}[/yellow]")
 
-    _send_tg(f"🏦 Bond Grinder started\nBudget: ${BOND_BUDGET}/day\n{pnl.summary()}")
+    budget_tg = "unlimited" if BOND_BUDGET <= 0 else f"${BOND_BUDGET}/day"
+    _send_tg(f"🏦 Bond Grinder started\nBudget: {budget_tg}\n{pnl.summary()}")
 
     try:
         while True:
@@ -447,6 +469,8 @@ async def run_bond_grinder():
                         "annualized_yield": round(opp.annualized_yield, 2),
                         "days_to_expiry": round(opp.days_to_expiry, 2),
                         "question": opp.market_question[:60],
+                        "end_date": opp.end_date,
+                        "hours_to_expiry": opp.hours_to_expiry,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "paper": True,
                     })
@@ -487,6 +511,8 @@ async def run_bond_grinder():
                             "condition_id": opp.condition_id,
                             "yield_pct": round(opp.yield_pct, 4),
                             "question": opp.market_question[:60],
+                            "end_date": opp.end_date,
+                            "hours_to_expiry": opp.hours_to_expiry,
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         })
                         pnl.total_invested += BOND_BET_SIZE
